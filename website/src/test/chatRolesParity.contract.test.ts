@@ -49,8 +49,12 @@ const REGISTRY_ONLY_ROLES: Record<string, string> = {
   done: 'lifecycle marker in raw snapshots; deliberately undrawn',
 }
 
+function chatPageTranscriptSource(): string {
+  return readFileSync(resolve(__dirname, '../pages/chat/useChatPageTranscriptController.tsx'), 'utf8')
+}
+
 function chatPageRoleLiterals(): Set<string> {
-  const src = readFileSync(resolve(__dirname, '../pages/ChatPage.tsx'), 'utf8')
+  const src = chatPageTranscriptSource()
   const roles = new Set<string>()
   // Both dispatch shapes used in the file: `m.role === 'x'` and
   // `messages[i].role === 'x'` (and their !== variants — a negative dispatch
@@ -68,8 +72,8 @@ function chatPageRoleLiterals(): Set<string> {
   // (the orphan check then reddens). If the dispatch shape is refactored,
   // update these patterns.
   const importsShared =
-    /import \{[^}]*\bhasReasoningContent\b[^}]*\} from '\.\/chat\/groupDisplayItems'/.test(src) &&
-    /import \{[^}]*\bisReasoningRole\b[^}]*\} from '\.\/chat\/groupDisplayItems'/.test(src)
+    /import \{[^}]*\bhasReasoningContent\b[^}]*\} from '\.\/groupDisplayItems'/.test(src) &&
+    /import \{[^}]*\bisReasoningRole\b[^}]*\} from '\.\/groupDisplayItems'/.test(src)
   const dispatchesReasoning =
     /hasReasoningContent\(\w+\)\)\s*return\s*<ThinkingBlock/.test(src) &&
     /isReasoningRole\(\w+\)\)\s*return\s*null/.test(src)
@@ -126,7 +130,7 @@ describe('chat role parity (ChatPage renderMessage vs app-sdk registry)', () => 
   })
 
   it('fails closed: every role dispatch in ChatPage uses the shape the extractor parses', () => {
-    const src = readFileSync(resolve(__dirname, '../pages/ChatPage.tsx'), 'utf8')
+    const src = chatPageTranscriptSource()
     // The extractor understands two idioms: `<expr>.role ===/!== '<literal>'`
     // and the shared reasoning predicates credited above. Any other dispatch
     // idiom — switch(m.role), a lookup map, comparison against a variable —

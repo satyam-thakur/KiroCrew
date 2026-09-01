@@ -247,7 +247,7 @@ describe('drift guard against the single-chat row chain', () => {
   // that one. If a row both sides draw ever diverges in component or props,
   // strengthen this into a static comparison of what each side passes rather
   // than migrating.
-  const chatPageSrc = readFileSync(join(__dirname, '..', 'pages', 'ChatPage.tsx'), 'utf8')
+  const chatPageSrc = readFileSync(join(__dirname, '..', 'pages', 'chat', 'useChatPageTranscriptController.tsx'), 'utf8')
 
   const rolesInChatPage = [...new Set(
     [...chatPageSrc.matchAll(/\.role === '([a-z_]+)'/g)].map(m => m[1]),

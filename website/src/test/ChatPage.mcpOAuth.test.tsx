@@ -19,22 +19,23 @@ import { dirname, resolve } from 'node:path'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const chatPageSrc = readFileSync(resolve(here, '../pages/ChatPage.tsx'), 'utf8')
+const transcriptSrc = readFileSync(resolve(here, '../pages/chat/useChatPageTranscriptController.tsx'), 'utf8')
 
 describe('ChatPage – MCP OAuth banner wiring', () => {
   it('imports the OAuth banner renderer', () => {
-    expect(chatPageSrc).toMatch(
+    expect(transcriptSrc).toMatch(
       /import\s*\{\s*renderMcpOAuthMessage\s*\}\s*from\s*['"][^'"]*McpOAuthBanner['"]/,
     )
   })
 
   it('routes the mcp_oauth message role to the banner renderer', () => {
-    expect(chatPageSrc).toMatch(/role\s*===\s*['"]mcp_oauth['"]/)
-    expect(chatPageSrc).toMatch(/renderMcpOAuthMessage\s*\(/)
+    expect(transcriptSrc).toMatch(/role\s*===\s*['"]mcp_oauth['"]/)
+    expect(transcriptSrc).toMatch(/renderMcpOAuthMessage\s*\(/)
   })
 
   it('keeps the banner branch and its renderer call in the same render path', () => {
-    const idxRole = chatPageSrc.search(/role\s*===\s*['"]mcp_oauth['"]/)
-    const idxCall = chatPageSrc.indexOf('renderMcpOAuthMessage(')
+    const idxRole = transcriptSrc.search(/role\s*===\s*['"]mcp_oauth['"]/)
+    const idxCall = transcriptSrc.indexOf('renderMcpOAuthMessage(')
     expect(idxRole).toBeGreaterThanOrEqual(0)
     expect(idxCall).toBeGreaterThanOrEqual(0)
     expect(Math.abs(idxCall - idxRole)).toBeLessThan(400)
@@ -52,6 +53,7 @@ describe('ChatPage – MCP OAuth banner wiring', () => {
       /import\s*\{\s*useConnectionsUiEnabled\s*\}\s*from\s*['"][^'"]*useConnectionsUi['"]/,
     )
     expect(chatPageSrc).toMatch(/const\s+connectionsUiOn\s*=\s*useConnectionsUiEnabled\(\)/)
-    expect(chatPageSrc).toMatch(/renderMcpOAuthMessage\(\s*m\s*,\s*connectionsUiOn\s*\)/)
+    expect(chatPageSrc).toMatch(/useChatPageTranscriptController\(\{[\s\S]*?connectionsUiOn,/)
+    expect(transcriptSrc).toMatch(/renderMcpOAuthMessage\(\s*m\s*,\s*connectionsUiOn\s*\)/)
   })
 })

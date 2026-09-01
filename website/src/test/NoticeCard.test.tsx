@@ -162,7 +162,7 @@ describe('NoticeCard', () => {
 describe('registry wiring', () => {
   it("ChatPage renders the notice role through NoticeCard, not a hand-rolled box", () => {
     const here = dirname(fileURLToPath(import.meta.url))
-    const src = readFileSync(resolve(here, '../pages/ChatPage.tsx'), 'utf8')
+    const src = readFileSync(resolve(here, '../pages/chat/useChatPageTranscriptController.tsx'), 'utf8')
     expect(src).toMatch(/m\.role === 'notice'.*<NoticeCard/)
     // The old inline branch carried its own class recipe; its return must be
     // gone so the style cannot fork again at this call site.

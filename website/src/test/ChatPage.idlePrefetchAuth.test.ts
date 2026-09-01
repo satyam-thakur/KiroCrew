@@ -31,7 +31,7 @@ import { join } from 'node:path'
  * exported seam; the arithmetic relation in the third test is the part most
  * likely to be broken silently by a later constant tweak.
  */
-const SRC = readFileSync(join(__dirname, '..', 'pages', 'ChatPage.tsx'), 'utf8')
+const SRC = readFileSync(join(__dirname, '..', 'pages', 'chat', 'useChatPageTranscriptController.tsx'), 'utf8')
 
 /** The idle-prefetch interval body. */
 function prefetchBody(): string {

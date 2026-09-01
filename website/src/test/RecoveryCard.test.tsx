@@ -336,7 +336,7 @@ describe('RecoveryCard', () => {
  * behaviour is covered above.
  */
 describe('ChatPage – recovery card wiring', () => {
-  const src = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../pages/ChatPage.tsx'), 'utf8')
+  const src = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../pages/chat/useChatPageTranscriptController.tsx'), 'utf8')
 
   it('imports the card and its shared resolver', () => {
     expect(src).toMatch(
