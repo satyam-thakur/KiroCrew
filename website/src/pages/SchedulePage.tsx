@@ -2,9 +2,9 @@ import { safeSetItem } from '../utils/safeStorage'
 import { useState, useEffect, useCallback, useRef, useMemo, Fragment } from 'react'
 import { useImeGuard } from '../hooks/useImeGuard'
 import Clickable from '../components/Clickable'
-import { List, CalendarDays, CalendarClock, Plus, ClipboardList, ChevronRight, Globe, History, Trash2, FolderPlus, MoreHorizontal, Pencil, Folder, LayoutGrid, GitPullRequestArrow, Download } from 'lucide-react'
+import { List, CalendarDays, CalendarClock, Plus, ClipboardList, ChevronRight, Globe, History, Trash2, FolderPlus, MoreHorizontal, Pencil, Folder, LayoutGrid, GitPullRequestArrow, Download, KeyRound } from 'lucide-react'
 import { api } from '../api/client'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useArmedDelete } from '../hooks/useArmedDelete'
 import { PageHeader, Card, Btn, SendBtn, Badge, SearchInput, EmptyState, FilteredEmpty, Skeleton, Input } from '../components/ui'
 import { CodeBlock } from '../components/CodeBlock'
@@ -1152,7 +1152,162 @@ function ScriptSourcePanel({ jobId }: { jobId: string }) {
 }
 
 /** Shape of GET /api/crons/{id}/script. */
-type CronScriptSource = { source: string; file: string; function: string; truncated: boolean }
+type CronScriptSource = {
+  source: string
+  file: string
+  function: string
+  truncated: boolean
+  /**
+   * Server verdict that the displayed source IS the raw body (not truncated,
+   * decoded losslessly, nothing masked by redaction). Only a reviewable body
+   * is approvable — the server re-derives this on approve, so this flag is a
+   * UX gate, not the enforcement.
+   */
+  reviewable: boolean
+  /** Digest of the raw source bytes; an approval must echo it back. */
+  sha256: string
+}
+
+/**
+ * Vault-secret grants for a script/command job — the operator half of the
+ * agent-first flow. Renders the agent's pending request as an approve/deny
+ * banner (approval re-verifies the request's code pin server-side), the
+ * active grant, and a small direct-grant editor. Env-var names and vault
+ * secret NAMES only; values never reach this page.
+ */
+export function JobSecretsPanel({ job, onSaved }: { job: CronJob; onSaved: () => void }) {
+  const [open, setOpen] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const pending = job.secret_env_pending ?? null
+  const active = job.secret_env ?? {}
+  // The script the approval would bless, loaded INSIDE the banner and keyed
+  // to the pending request's revision: an agent can rewrite the script and
+  // re-issue the request while this page is open, and the job refresh that
+  // swaps the banner to the new request must swap the source with it — a
+  // source view cached by job id alone would keep showing the old code under
+  // the new request's approve button. Approval stays disabled until this
+  // exact revision's source has rendered, and the approve call echoes its
+  // digest so the server refuses to promote code the operator did not see.
+  const source = useQuery({
+    queryKey: ['cronScript', job.id, 'pending', job.secret_env_pending_ts ?? 0],
+    queryFn: async () => (await api.cronScript(job.id)) as CronScriptSource,
+    enabled: pending !== null,
+    staleTime: 0,
+  })
+  const reviewed = source.data && source.data.reviewable ? source.data : null
+  const grant = useMutation({
+    mutationFn: (body: Parameters<typeof api.cronSecretsGrant>[1]) =>
+      api.cronSecretsGrant(job.id, body),
+    onMutate: () => setError(null),
+    onSuccess: () => onSaved(),
+    onError: (e: unknown) =>
+      setError(e instanceof Error ? e.message : i18nT('pages.schedulePage.failed')),
+  })
+  const busy = grant.isPending
+  const act = (body: Parameters<typeof api.cronSecretsGrant>[1]) => grant.mutate(body)
+  return (
+    <div className="flex flex-col gap-1.5">
+      {pending && (
+        <div className="flex flex-col gap-2 px-3 py-2.5 rounded-lg bg-warn-subtle text-warn-fg" role="note">
+          <div className="flex items-center gap-1.5 text-[13px] font-semibold">
+            <KeyRound size={14} className="lucide-inline shrink-0" aria-hidden="true" />
+            {i18nT('pages.schedulePage.secrets_pending_title')}
+          </div>
+          <ul className="flex flex-col gap-0.5 text-[12.5px] font-mono">
+            {Object.entries(pending).map(([env, name]) => (
+              <li key={env} className="min-w-0 break-all">{env} ← {name}</li>
+            ))}
+          </ul>
+          <div className="text-[12px] opacity-90">{i18nT('pages.schedulePage.secrets_pending_help')}</div>
+          <div className="text-[12px] font-medium">{i18nT('pages.schedulePage.secrets_pending_source')}</div>
+          {source.isPending && (
+            <>
+              <Skeleton className="h-16 rounded-xl" />
+              <div className="text-[12px] opacity-90">{i18nT('pages.schedulePage.secrets_pending_source_loading')}</div>
+            </>
+          )}
+          {source.isError && (
+            <ErrorNotice message={i18nT('pages.schedulePage.secrets_pending_source_failed')} askAgent />
+          )}
+          {source.data && source.data.truncated && (
+            <ErrorNotice message={i18nT('pages.schedulePage.secrets_pending_source_truncated')} askAgent />
+          )}
+          {source.data && !source.data.truncated && !source.data.reviewable && (
+            <ErrorNotice message={i18nT('pages.schedulePage.secrets_pending_source_unreviewable')} askAgent />
+          )}
+          {source.data && <CodeBlock code={source.data.source} lang="python" complete />}
+          <div className="flex gap-2">
+            <SendBtn
+              disabled={busy || !reviewed}
+              onClick={() =>
+                reviewed &&
+                act({
+                  approve_pending: true,
+                  // Restate what THIS banner displayed: the backend refuses
+                  // (409 stale_request) if the pending request was replaced
+                  // after render, so an unseen request can never be approved.
+                  expected_secret_env: pending,
+                  expected_ts: job.secret_env_pending_ts ?? undefined,
+                  // ...and the digest of the source rendered above (409
+                  // stale_source if the file no longer matches it).
+                  expected_source_sha256: reviewed.sha256,
+                })
+              }
+            >
+              {i18nT('pages.schedulePage.secrets_approve')}
+            </SendBtn>
+            <Btn
+              danger
+              disabled={busy}
+              onClick={() =>
+                act({
+                  deny_pending: true,
+                  expected_secret_env: pending,
+                  // The timestamp distinguishes a REISSUED request with an
+                  // identical mapping from the one this banner displayed —
+                  // a stale denial must not delete the reissue.
+                  expected_ts: job.secret_env_pending_ts ?? undefined,
+                })
+              }
+            >
+              {i18nT('pages.schedulePage.secrets_deny')}
+            </Btn>
+          </div>
+        </div>
+      )}
+      <Clickable
+        className="flex items-center gap-1 w-fit text-[12px] text-muted font-medium hover:text-text cursor-pointer"
+        onClick={() => setOpen(o => !o)}
+        aria-expanded={open}
+      >
+        <ChevronRight size={14} className={`lucide-inline transition-transform ${open ? 'rotate-90' : ''}`} aria-hidden="true" />
+        {i18nT('pages.schedulePage.secrets_section')}
+        {Object.keys(active).length > 0 && <Badge variant="ok">{Object.keys(active).length}</Badge>}
+      </Clickable>
+      {open && (
+        <div className="flex flex-col gap-2">
+          {Object.keys(active).length === 0 && (
+            <div className="text-[12.5px] text-muted">{i18nT('pages.schedulePage.secrets_none')}</div>
+          )}
+          {Object.entries(active).map(([env, name]) => (
+            <div key={env} className="flex items-start gap-2 text-[12.5px] min-w-0">
+              <code className="font-mono text-text min-w-0 break-all">{env}</code>
+              <span className="text-muted shrink-0" aria-hidden="true">←</span>
+              <code className="font-mono text-muted min-w-0 break-all">{name}</code>
+            </div>
+          ))}
+          <div className="text-[12px] text-muted">{i18nT('pages.schedulePage.secrets_active_help')}</div>
+          {Object.keys(active).length > 0 && (
+            <Btn danger disabled={busy} className="w-fit" onClick={() => act({ secret_env: {} })}>
+              {i18nT('pages.schedulePage.secrets_revoke_all')}
+            </Btn>
+          )}
+        </div>
+      )}
+      <ErrorNotice message={error} askAgent />
+    </div>
+  )
+}
 
 /**
  * Job detail / create view, rendered as a shadcn (Radix) dialog.
@@ -1223,6 +1378,7 @@ function JobDetailDialog({ job, prefill, prefillWrites, agents, defaultAgent, ro
             <JobForm job={job} prefill={prefill} agents={agents} defaultAgent={defaultAgent} rosterFailure={rosterFailure} onSaved={onSaved} layout="vertical" externalSubmit submitRef={submitRef} onSavingChange={setSaving} />
             {panelError && <div className="text-danger text-[13px]">{panelError}</div>}
             {job?.script && <ScriptSourcePanel jobId={job.id} />}
+            {job && job.script && <JobSecretsPanel job={job} onSaved={onSaved} />}
             {job?.script && (job.last_result || job.last_error) && (
               <div className="flex flex-col gap-1.5">
                 <div className="text-[12px] text-muted font-medium">{job.last_error ? i18nT('pages.schedulePage.last_error') : i18nT('pages.schedulePage.last_output')}</div>
