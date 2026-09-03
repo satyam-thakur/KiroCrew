@@ -4767,7 +4767,20 @@
         "library_remove_failed": "제거하지 못했습니다. 클라우드 사본은 그대로입니다. 다시 시도하세요.",
         "move_conflict": "대상 폴더에 같은 이름의 파일이 이미 있습니다.",
         "move_shared": "이 파일에는 유효한 공유 링크가 있습니다. 이동하면 링크가 끓어집니다. 공유를 제거하거나 만료될 때까지 기다린 뒤 다시 시도하세요.",
-        "move_failed": "파일을 이동하지 못했습니다. 다시 시도하세요."
+        "rename": "이름 바꾸기",
+        "preview_truncated": "파일이 커서 앞부분만 표시합니다.",
+        "preview_unsupported": "이 파일 형식은 미리보기를 지원하지 않습니다. 다운로드해서 확인하세요.",
+        "preview_failed": "미리보기를 불러오지 못했습니다. 다운로드해서 확인하세요.",
+        "search_files": "파일 검색…",
+        "search_clear": "검색 지우기",
+        "search_no_results": "일치하는 파일이 없습니다.",
+        "search_capped": "일치 항목이 너무 많아 첫 {{count}}개만 표시합니다.",
+        "search_failed": "검색에 실패했습니다. 다시 시도하세요.",
+        "search_goto": "포함 폴더 열기",
+        "move_failed": "파일을 이동하지 못했습니다. 다시 시도하세요.",
+        "rename_conflict": "같은 이름의 파일이 이미 여기에 있습니다.",
+        "rename_shared": "이 파일에는 유효한 공유 링크가 있습니다. 이름을 바꾸면 링크가 끊어집니다. 공유를 제거하거나 만료될 때까지 기다린 뒤 다시 시도하세요.",
+        "rename_failed": "파일 이름을 바꾸지 못했습니다. 다시 시도하세요."
       },
       "page": {
         "totals_summary": "계정 {{accounts}}개 · 키 {{keys}}개 · 정상 {{healthy}}개",

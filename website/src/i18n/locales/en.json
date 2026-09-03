@@ -3731,7 +3731,20 @@
         "library_remove_failed": "Remove failed — the cloud copy is unchanged. Try again.",
         "move_conflict": "The destination folder already has a file with this name.",
         "move_shared": "This file has a live share link — moving it would break the link. Remove the share (or let it expire) and try again.",
-        "move_failed": "Could not move the file. Try again."
+        "rename": "Rename",
+        "preview_truncated": "Large file — showing only the beginning.",
+        "preview_unsupported": "This file type can’t be previewed. Download it to view.",
+        "preview_failed": "Preview failed to load. Download the file to view it.",
+        "search_files": "Search files…",
+        "search_clear": "Clear search",
+        "search_no_results": "No files match.",
+        "search_capped": "Too many matches — showing the first {{count}}.",
+        "search_failed": "Search failed. Try again.",
+        "search_goto": "Open containing folder",
+        "move_failed": "Could not move the file. Try again.",
+        "rename_conflict": "A file with this name already exists here.",
+        "rename_shared": "This file has a live share link — renaming it would break the link. Remove the share (or let it expire) and try again.",
+        "rename_failed": "Could not rename the file. Try again."
       },
       "page": {
         "totals_summary": "{{accounts}} accounts · {{keys}} keys · {{healthy}} healthy",

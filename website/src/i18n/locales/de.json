@@ -4847,7 +4847,20 @@
         "library_remove_failed": "Entfernen fehlgeschlagen — die Cloud-Kopie ist unverändert. Erneut versuchen.",
         "move_conflict": "Der Zielordner enthält bereits eine Datei mit diesem Namen.",
         "move_shared": "Diese Datei hat einen aktiven Freigabelink — beim Verschieben würde der Link ungültig. Entfernen Sie die Freigabe (oder lassen Sie sie ablaufen) und versuchen Sie es erneut.",
-        "move_failed": "Die Datei konnte nicht verschoben werden. Versuche es erneut."
+        "rename": "Umbenennen",
+        "preview_truncated": "Große Datei — nur der Anfang wird angezeigt.",
+        "preview_unsupported": "Dieser Dateityp kann nicht als Vorschau angezeigt werden. Zum Ansehen herunterladen.",
+        "preview_failed": "Vorschau konnte nicht geladen werden. Laden Sie die Datei zum Ansehen herunter.",
+        "search_files": "Dateien durchsuchen…",
+        "search_clear": "Suche löschen",
+        "search_no_results": "Keine passenden Dateien.",
+        "search_capped": "Zu viele Treffer — nur die ersten {{count}} werden angezeigt.",
+        "search_failed": "Suche fehlgeschlagen. Versuchen Sie es erneut.",
+        "search_goto": "Enthaltenden Ordner öffnen",
+        "move_failed": "Die Datei konnte nicht verschoben werden. Versuche es erneut.",
+        "rename_conflict": "Eine Datei mit diesem Namen existiert hier bereits.",
+        "rename_shared": "Diese Datei hat einen aktiven Freigabelink — eine Umbenennung würde den Link ungültig machen. Entfernen Sie die Freigabe (oder lassen Sie sie ablaufen) und versuchen Sie es erneut.",
+        "rename_failed": "Die Datei konnte nicht umbenannt werden. Versuchen Sie es erneut."
       },
       "page": {
         "totals_summary": "{{accounts}} Konten · {{keys}} Schlüssel · {{healthy}} fehlerfrei",

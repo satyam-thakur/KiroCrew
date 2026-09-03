@@ -286,9 +286,9 @@ resources itself.
 ## HTTP surface
 
 `routes.register_routes` exposes owner-gated reads for accounts, available
-profiles, reconnect guidance, drive status/list/download, costs, library,
-backup status, share metadata, and rendered IAM policy. Its mutations are
-profile registration; drive bootstrap, upload, delete, move, folder
+profiles, reconnect guidance, drive status/list/download/preview/search, costs,
+library, backup status, share metadata, and rendered IAM policy. Its mutations
+are profile registration; drive bootstrap, upload, delete, move, folder
 create/delete, and share; share-ledger removal; library push and library
 removal; backup run, nightly toggle, and staged restore.
 

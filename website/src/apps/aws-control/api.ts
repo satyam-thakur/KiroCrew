@@ -19,6 +19,8 @@ import type {
   DriveBootstrapResult,
   DriveListing,
   DriveDownload,
+  DrivePreview,
+  DriveSearch,
   DriveUploadResult,
   DriveDeleteResult,
   DriveFolderResult,
@@ -197,6 +199,22 @@ export const awsControlApi = {
   driveDownload(account: string, section: DriveSection, key: string): Promise<DriveDownload> {
     const q = new URLSearchParams({ section, key })
     return request<DriveDownload>(`/drive/${enc(account)}/download?${q.toString()}`)
+  },
+
+  /** The first bytes of a TEXT file, proxied through the gateway. A browser
+   *  fetch of the presigned URL would be blocked by CORS (the bucket carries
+   *  no CORS config), so text preview reads through this endpoint instead;
+   *  media previews (img/video/iframe) use the presigned URL directly because
+   *  those tags are exempt from CORS. */
+  drivePreview(account: string, section: DriveSection, key: string): Promise<DrivePreview> {
+    const q = new URLSearchParams({ section, key })
+    return request<DrivePreview>(`/drive/${enc(account)}/preview?${q.toString()}`)
+  },
+
+  /** Case-insensitive filename search across one whole section. */
+  driveSearch(account: string, section: DriveSection, query: string): Promise<DriveSearch> {
+    const q = new URLSearchParams({ section, q: query })
+    return request<DriveSearch>(`/drive/${enc(account)}/search?${q.toString()}`)
   },
 
   /** Move one stored object inside the files section (server-side copy, then

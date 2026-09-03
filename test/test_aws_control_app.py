@@ -51,6 +51,8 @@ P0_ROUTES: tuple[tuple[str, str], ...] = (
     ("GET", "/drive/{account}"),
     ("GET", "/drive/{account}/list"),
     ("GET", "/drive/{account}/download"),
+    ("GET", "/drive/{account}/preview"),
+    ("GET", "/drive/{account}/search"),
     ("GET", "/costs/{account}"),
     ("GET", "/library/{account}"),
     ("GET", "/backup/{account}"),

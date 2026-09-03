@@ -184,6 +184,29 @@ export interface DriveDownload {
   expiresSecs: number
 }
 
+/** Payload of `GET /drive/{account}/preview` — the head bytes of a text file,
+ *  decoded utf-8. `truncated` says the file continues past the preview window. */
+export interface DrivePreview {
+  content: string
+  truncated: boolean
+}
+
+/** One filename-search hit. `key` is section-relative (full path, not basename). */
+export interface DriveSearchHit {
+  key: string
+  size: number
+  modified: string
+}
+
+/** Payload of `GET /drive/{account}/search`. `capped` says the walk stopped at
+ *  `limit` hits — more matches may exist beyond it. The server owns the cap
+ *  and echoes it so the notice can name the real number. */
+export interface DriveSearch {
+  results: DriveSearchHit[]
+  capped: boolean
+  limit: number
+}
+
 /** Result of `POST /drive/{account}/upload`. */
 export interface DriveUploadResult {
   uploaded: true

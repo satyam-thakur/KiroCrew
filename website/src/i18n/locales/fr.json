@@ -4927,7 +4927,20 @@
         "library_remove_failed": "Échec du retrait — la copie cloud est intacte. Réessayez.",
         "move_conflict": "Le dossier de destination contient déjà un fichier portant ce nom.",
         "move_shared": "Ce fichier a un lien de partage actif : le déplacer casserait le lien. Supprimez le partage (ou laissez-le expirer), puis réessayez.",
-        "move_failed": "Impossible de déplacer le fichier. Réessayez."
+        "rename": "Renommer",
+        "preview_truncated": "Fichier volumineux : seul le début est affiché.",
+        "preview_unsupported": "Ce type de fichier ne peut pas être prévisualisé. Téléchargez-le pour le consulter.",
+        "preview_failed": "L’aperçu n’a pas pu être chargé. Téléchargez le fichier pour le consulter.",
+        "search_files": "Rechercher des fichiers…",
+        "search_clear": "Effacer la recherche",
+        "search_no_results": "Aucun fichier ne correspond.",
+        "search_capped": "Trop de résultats : seuls les {{count}} premiers sont affichés.",
+        "search_failed": "La recherche a échoué. Réessayez.",
+        "search_goto": "Ouvrir le dossier parent",
+        "move_failed": "Impossible de déplacer le fichier. Réessayez.",
+        "rename_conflict": "Un fichier portant ce nom existe déjà ici.",
+        "rename_shared": "Ce fichier a un lien de partage actif : le renommer casserait le lien. Supprimez le partage (ou laissez-le expirer) et réessayez.",
+        "rename_failed": "Impossible de renommer le fichier. Réessayez."
       },
       "page": {
         "totals_summary": "{{accounts}} comptes · {{keys}} clés · {{healthy}} en bon état",

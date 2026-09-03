@@ -4927,7 +4927,20 @@
         "library_remove_failed": "Falha ao remover — a cópia na nuvem está inalterada. Tente novamente.",
         "move_conflict": "A pasta de destino já tem um arquivo com este nome.",
         "move_shared": "Este arquivo tem um link de compartilhamento ativo — movê-lo quebraria o link. Remova o compartilhamento (ou deixe-o expirar) e tente novamente.",
-        "move_failed": "Não foi possível mover o arquivo. Tente novamente."
+        "rename": "Renomear",
+        "preview_truncated": "Arquivo grande — mostrando apenas o início.",
+        "preview_unsupported": "Este tipo de arquivo não pode ser visualizado. Baixe-o para ver.",
+        "preview_failed": "Falha ao carregar a prévia. Baixe o arquivo para vê-lo.",
+        "search_files": "Pesquisar arquivos…",
+        "search_clear": "Limpar pesquisa",
+        "search_no_results": "Nenhum arquivo corresponde.",
+        "search_capped": "Muitos resultados — mostrando os primeiros {{count}}.",
+        "search_failed": "A pesquisa falhou. Tente novamente.",
+        "search_goto": "Abrir pasta contêiner",
+        "move_failed": "Não foi possível mover o arquivo. Tente novamente.",
+        "rename_conflict": "Já existe um arquivo com este nome aqui.",
+        "rename_shared": "Este arquivo tem um link de compartilhamento ativo — renomeá-lo quebraria o link. Remova o compartilhamento (ou deixe-o expirar) e tente novamente.",
+        "rename_failed": "Não foi possível renomear o arquivo. Tente novamente."
       },
       "page": {
         "totals_summary": "{{accounts}} contas · {{keys}} chaves · {{healthy}} íntegras",

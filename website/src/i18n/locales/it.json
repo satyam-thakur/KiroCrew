@@ -4927,7 +4927,20 @@
         "library_remove_failed": "Rimozione non riuscita: la copia cloud è invariata. Riprova.",
         "move_conflict": "La cartella di destinazione contiene già un file con questo nome.",
         "move_shared": "Questo file ha un link di condivisione attivo: spostarlo interromperebbe il link. Rimuovi la condivisione (o lascia che scada) e riprova.",
-        "move_failed": "Impossibile spostare il file. Riprova."
+        "rename": "Rinomina",
+        "preview_truncated": "File di grandi dimensioni: viene mostrato solo l'inizio.",
+        "preview_unsupported": "Questo tipo di file non può essere visualizzato in anteprima. Scaricalo per vederlo.",
+        "preview_failed": "Impossibile caricare l’anteprima. Scarica il file per vederlo.",
+        "search_files": "Cerca file…",
+        "search_clear": "Cancella ricerca",
+        "search_no_results": "Nessun file corrisponde.",
+        "search_capped": "Troppi risultati: vengono mostrati solo i primi {{count}}.",
+        "search_failed": "Ricerca non riuscita. Riprova.",
+        "search_goto": "Apri cartella contenitore",
+        "move_failed": "Impossibile spostare il file. Riprova.",
+        "rename_conflict": "Qui esiste già un file con questo nome.",
+        "rename_shared": "Questo file ha un link di condivisione attivo: rinominarlo interromperebbe il link. Rimuovi la condivisione (o lasciala scadere) e riprova.",
+        "rename_failed": "Impossibile rinominare il file. Riprova."
       },
       "page": {
         "totals_summary": "{{accounts}} account · {{keys}} chiavi · {{healthy}} integre",

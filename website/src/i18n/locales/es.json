@@ -4927,7 +4927,20 @@
         "library_remove_failed": "No se pudo quitar: la copia en la nube no ha cambiado. Inténtalo de nuevo.",
         "move_conflict": "La carpeta de destino ya tiene un archivo con este nombre.",
         "move_shared": "Este archivo tiene un enlace de uso compartido activo: moverlo rompería el enlace. Elimina el enlace (o deja que caduque) e inténtalo de nuevo.",
-        "move_failed": "No se pudo mover el archivo. Inténtalo de nuevo."
+        "rename": "Cambiar nombre",
+        "preview_truncated": "Archivo grande: solo se muestra el principio.",
+        "preview_unsupported": "Este tipo de archivo no se puede previsualizar. Descárgalo para verlo.",
+        "preview_failed": "No se pudo cargar la vista previa. Descarga el archivo para verlo.",
+        "search_files": "Buscar archivos…",
+        "search_clear": "Borrar búsqueda",
+        "search_no_results": "Ningún archivo coincide.",
+        "search_capped": "Demasiadas coincidencias: se muestran las primeras {{count}}.",
+        "search_failed": "La búsqueda falló. Inténtalo de nuevo.",
+        "search_goto": "Abrir carpeta contenedora",
+        "move_failed": "No se pudo mover el archivo. Inténtalo de nuevo.",
+        "rename_conflict": "Ya existe un archivo con este nombre aquí.",
+        "rename_shared": "Este archivo tiene un enlace compartido activo: cambiarle el nombre rompería el enlace. Elimina el recurso compartido (o deja que caduque) e inténtalo de nuevo.",
+        "rename_failed": "No se pudo cambiar el nombre del archivo. Inténtalo de nuevo."
       },
       "page": {
         "totals_summary": "{{accounts}} cuentas · {{keys}} claves · {{healthy}} en buen estado",
