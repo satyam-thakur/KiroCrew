@@ -38,6 +38,8 @@ import {
   retireStatelessQuestion, capturePendingAskId, confirmOptimisticSend, resolveOptimisticSteer,
   requestSlotReveal,
   mcpAppKey,
+  selectAutomationForSlot,
+  sseAutomation,
 } from '../store/chatSlice'
 import { confirmedDelivered, readSendReceipt } from '../utils/sendDelivery'
 import { addNotification, removeNotificationByTs } from '../store/notificationsSlice'
@@ -52,7 +54,7 @@ import { revealOrOpen } from '../components/FilePathMenu'
 import { resolveAskAfterSend } from '../lib/resolveAskAfterSend'
 import type { PlanStepInput } from '../api/client'
 import { useProvider } from '../providers'
-import { type AutoNudgeLoop } from '../components/AutoNudgePopover'
+import { normalizeAutomationRecord, type AutomationRecord } from '../monitoring/automation'
 import { fileReadUrl } from '../utils/fileReadUrl'
 import { safeSetItem, safeSetSessionItem } from '../utils/safeStorage'
 import { handleStopPress, isEscalationState } from '../utils/stopDebounce'
@@ -1618,8 +1620,48 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const [reasoningEffortDropdown, setReasoningEffortDropdown] = useState(false)
   const [reasoningEffortBtnRect, setReasoningEffortBtnRect] = useState<DOMRect | null>(null)
   const reasoningEffortDropdownRef = useRef<HTMLDivElement>(null)
-  const [autoNudgeOpen, setAutoNudgeOpen] = useState(false)
-  const [autoNudgeLoop, setAutoNudgeLoop] = useState<AutoNudgeLoop | null>(null)
+  const [automationOpen, setAutomationOpen] = useState(false)
+  const liveAutomation = useAppSelector(state => activeSlot
+    ? selectAutomationForSlot(state, activeSlot)
+    : null)
+  const automationSnapshot = useQuery({
+    queryKey: ['session-automation', activeSlot],
+    enabled: !!activeSlot,
+    queryFn: async () => {
+      const slot = activeSlot!
+      const [legacy, structured] = await Promise.all([
+        api.autonudgeForSlot(slot),
+        api.monitorForSlot(slot),
+      ])
+      const legacySnapshot = legacy.loop === null
+        ? null
+        : normalizeAutomationRecord(legacy.loop)
+      const structuredRecord = structured.monitor === null
+        ? null
+        : normalizeAutomationRecord(structured.monitor)
+      if ((legacy.loop !== null && !legacySnapshot)
+        || (structured.monitor !== null
+          && structuredRecord?.kind !== 'structured_monitor')) {
+        throw new Error('Invalid session automation snapshot')
+      }
+      const legacyRecord = legacySnapshot?.kind === 'legacy_goal_loop'
+        ? legacySnapshot
+        : null
+      if (legacyRecord && structuredRecord) {
+        throw new Error('Conflicting session automation snapshot')
+      }
+      return structuredRecord ?? legacyRecord
+    },
+    staleTime: 0,
+  })
+  // A live record wins over the cold read. After a removal frame, the WS hook
+  // invalidates this query before clearing Redux, so stale cached absence or
+  // presence can never enable a replacing create while the refresh is pending.
+  const automation = liveAutomation ?? automationSnapshot.data ?? null
+  const automationId = automation?.id
+  const automationCreationReady = !!automation
+    || (automationSnapshot.isSuccess && !automationSnapshot.isFetching)
+  const automationSnapshotFailed = automationSnapshot.isError
   const approvalMode = useAppSelector(s => s.dashboard.approvalMode)
 
   // ── Reasoning effort dropdown click-outside ──
@@ -1637,28 +1679,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     return () => document.removeEventListener('mousedown', handler)
   }, [reasoningEffortDropdown, reasoningEffortBtnRect])
 
-  // ── Auto-nudge: fetch loop state for active slot, subscribe to WS updates ──
+  // Close the slot-scoped automation surface on navigation. Its record comes
+  // from the same Redux collection the sidebar reads; the WebSocket hook owns
+  // both the cold REST snapshot and live updates.
   useEffect(() => {
-    // Clear stale state and close the popover on slot switch so it remounts
-    // with fresh useState initializers sourced from the new slot's loop.
-    // Otherwise the popover's internal message/idleSecs/maxCycles retain
-    // values from the previously-active slot and a Start click would arm the
-    // wrong nudge on the new session.
-    setAutoNudgeLoop(null)
-    setAutoNudgeOpen(false)
-    if (!activeSlot) return
-    let cancelled = false
-    fetch(`/api/autonudge/slot/${encodeURIComponent(activeSlot)}`)
-      .then(r => r.json())
-      .then(d => { if (!cancelled) setAutoNudgeLoop(d.loop || null) })
-      .catch(() => {})
-    const onEvent = (e: Event) => {
-      const detail = (e as CustomEvent).detail as { slot?: string; loop?: AutoNudgeLoop; event?: string }
-      if (!detail || detail.slot !== activeSlot) return
-      setAutoNudgeLoop(detail.event === 'removed' ? null : (detail.loop ?? null))
-    }
-    window.addEventListener('autonudge_state', onEvent)
-    return () => { cancelled = true; window.removeEventListener('autonudge_state', onEvent) }
+    setAutomationOpen(false)
   }, [activeSlot])
   const {
     scrollerRef,
@@ -7537,8 +7562,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // bound to the slot, so a historical card never opens a successor loop's
     // controls.
     if (m.role === 'nudge') {
-      const ownLoop = nudgeMatchesLoop(m, autoNudgeLoop?.id)
-      return <NudgeCard key={key} message={m} disclosureKey={key} onOpenLoop={ownLoop ? () => setAutoNudgeOpen(true) : undefined} />
+      const ownLoop = nudgeMatchesLoop(m, automationId)
+      return <NudgeCard key={key} message={m} disclosureKey={key} onOpenLoop={ownLoop ? () => setAutomationOpen(true) : undefined} />
     }
     if (m.kind === 'stop_event' || m.meta?.kind === 'stop_event') return <StopEventCard key={m.meta?.id as string ?? key} message={m} />
     // A synthetic turn-recovery continuation (tool refusal / stalled turn /
@@ -7703,7 +7728,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // defeat memo(TurnBlock) for settled turns. Excluding it instead would leave it
     // captured across a render where the find pane opens, and the stale copy would
     // open an app tab behind the still-hidden dock.
-  }, [slotRunning, handleFileOpen, handleArtifactOpen, selectSessionTab, sessionTitles, connected, handleFork, handleQuote, handleAsk, chatConfig, activeSlot, regenerating, handleRegenerate, handleEditResend, slotHasMore, loadingOlder, cursorIsForActiveSlot, slotOldestIndex, handleLoadEarlier, renderUserContentCb, highlightTs, activeSlotTitle, mode, embedded, popout, handleOpenDiff, handlePlanFromHere, planTaskId, artifactPaths, autoNudgeLoop, toolDisclosure, setToolDisclosureFor, linkPreviewsOn, handleSubagentPanelOpen, isPinned, handleTogglePinForMessage, connectionsUiOn, showRefusedPress, transcriptHot, revealAppInPanel, continuable, interrupted, continuing, lastErrorIdx, handleContinue, handleFolderOpen, handleSpeak, handleApplyPlan, mcpAppPanel])
+  }, [slotRunning, handleFileOpen, handleArtifactOpen, selectSessionTab, sessionTitles, connected, handleFork, handleQuote, handleAsk, chatConfig, activeSlot, regenerating, handleRegenerate, handleEditResend, slotHasMore, loadingOlder, cursorIsForActiveSlot, slotOldestIndex, handleLoadEarlier, renderUserContentCb, highlightTs, activeSlotTitle, mode, embedded, popout, handleOpenDiff, handlePlanFromHere, planTaskId, artifactPaths, automationId, toolDisclosure, setToolDisclosureFor, linkPreviewsOn, handleSubagentPanelOpen, isPinned, handleTogglePinForMessage, connectionsUiOn, showRefusedPress, transcriptHot, revealAppInPanel, continuable, interrupted, continuing, lastErrorIdx, handleContinue, handleFolderOpen, handleSpeak, handleApplyPlan, mcpAppPanel])
 
   // Hoisted out of the row map so every TurnBlock receives the SAME function
   // identity per render — an inline closure there re-created it per row per
@@ -9430,10 +9455,22 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               providerId={provider.id}
               reasoningEffort={effectiveEffort}
               onReasoningEffortClick={provider.capabilities.reasoningEffort && modelSupportsEffort(shownModel === 'auto' ? '' : shownModel) ? (rect) => { setReasoningEffortBtnRect(rect); setReasoningEffortDropdown(!reasoningEffortDropdown) } : undefined}
-              onAutoNudgeClick={setAutoNudgeOpen}
-              autoNudgeLoop={autoNudgeLoop}
-              autoNudgeOpen={autoNudgeOpen}
-              onAutoNudgeChange={setAutoNudgeLoop}
+              onAutomationClick={setAutomationOpen}
+              automation={automation}
+              automationOpen={automationOpen}
+              automationCreationReady={automationCreationReady}
+              automationSnapshotFailed={automationSnapshotFailed}
+              sessionMode={currentSlot?.mode || mode}
+              onAutomationChange={(next: AutomationRecord | null) => {
+                if (next) {
+                  queryClient.setQueryData(['session-automation', next.slotKey], next)
+                  dispatch(sseAutomation(next))
+                }
+                else if (automation?.kind === 'legacy_goal_loop') {
+                  queryClient.setQueryData(['session-automation', automation.slotKey], null)
+                  dispatch(sseAutomation({ ...automation, active: false }))
+                }
+              }}
               onOptimizeResult={handleOptimizeResult}
               memoryMode={currentSlot?.memory_mode ?? 'persistent'}
               cleanMode={currentSlot?.clean_mode}
