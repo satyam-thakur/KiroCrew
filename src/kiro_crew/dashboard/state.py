@@ -3134,6 +3134,7 @@ class _ChatSlot:
         "_queue_repository",
         "_source_links_cache",
         "_source_links_revision",
+        "_closing",
         "key",
         "title",
         "agent",
@@ -3363,6 +3364,8 @@ class _ChatSlot:
         # (content revision, links) cache for the sidebar PR chips scan.
         self._source_links_revision = 0
         self._source_links_cache: tuple[tuple[int, int], list[dict]] | None = None
+        # Admission fence while slot deletion spans monitor retirement and history I/O.
+        self._closing = False
         self.total_messages: int = 0  # lifetime count (survives trimming)
         self._task: asyncio.Task[Any] | None = None
         # Monotonic publication history for turn ownership. ``task`` returns to

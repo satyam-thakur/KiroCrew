@@ -99,6 +99,17 @@ PROVIDER_EXECUTABLE_CANDIDATES = {
     for executable in ("gh", "glab", "az")
 }
 
+
+def gitlab_ambient_token_allowed(host: str) -> bool:
+    """Whether the unscoped ambient GitLab token may reach *host*.
+
+    ``GITLAB_TOKEN`` has no host binding. Self-managed instances authenticate
+    through glab's per-host config instead, so a gitlab.com token cannot be
+    presented to a different server.
+    """
+    return host.casefold() == "gitlab.com"
+
+
 # Windows equivalents of the well-known dirs above, as the *subdirectory* each
 # installer creates under a Program Files root. Expanded at call time rather
 # than at import, because the roots come from the environment. These lead the
@@ -108,6 +119,7 @@ PROVIDER_EXECUTABLE_CANDIDATES = {
 WINDOWS_PROVIDER_EXECUTABLE_SUBDIRS = {
     "gh": ("GitHub CLI",),
     "glab": ("GitLab CLI", "glab"),
+    "az": (os.path.join("Microsoft SDKs", "Azure", "CLI2", "wbin"),),
 }
 WINDOWS_PROGRAM_ROOT_VARS = ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)")
 

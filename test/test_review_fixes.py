@@ -356,6 +356,27 @@ class TestLoadCredentialsEnvPropagation:
         assert os.environ.get("SLACK_APP_TOKEN") == "xapp-test"
         assert os.environ.get("KIROCREW_OWNER_ID") == "U123"
 
+    def test_non_propagating_read_keeps_credentials_out_of_environ(
+        self, tmp_path: object, monkeypatch
+    ) -> None:
+        import os
+        from pathlib import Path
+
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        monkeypatch.delenv("AZURE_DEVOPS_EXT_PAT", raising=False)
+        tmp = Path(str(tmp_path))
+        env_file = tmp / ".env"
+        env_file.write_text("AZURE_DEVOPS_EXT_PAT=probe-token\n")
+        env_file.chmod(0o600)
+
+        with patch("kiro_crew.config.loader.env_path", return_value=env_file):
+            cfg = KiroCrewConfig.__new__(KiroCrewConfig)
+            creds = cfg.load_credentials(propagate=False)
+
+        assert creds["AZURE_DEVOPS_EXT_PAT"] == "probe-token"
+        assert "AZURE_DEVOPS_EXT_PAT" not in os.environ
+
     def test_existing_env_value_preserved(self, tmp_path: object, monkeypatch) -> None:
         """setdefault() must not clobber a value the caller set explicitly
         (e.g. systemd Environment= block, wrapper script export)."""
@@ -474,6 +495,9 @@ class TestLoadCredentialsEnvPropagation:
             "FEISHU_APP_ID",
             "FEISHU_APP_SECRET",
             "JIRA_API_TOKEN",
+            "AZURE_DEVOPS_EXT_PAT",
+            "BITBUCKET_EMAIL",
+            "BITBUCKET_API_TOKEN",
             "KIRO_API_KEY",
         )
         assert set(fixture_keys) == set(_CREDENTIAL_KEYS)

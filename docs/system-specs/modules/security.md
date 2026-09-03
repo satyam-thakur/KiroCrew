@@ -1429,6 +1429,83 @@ than an egress surface. The structured monitor controller is the corresponding
 registered redaction sink: it passes the complete bounded wake envelope through the
 exfiltration-URL and credential scanners before injecting it into an agent session.
 
+**Additional structured source-provider boundaries**
+(`monitoring/gitlab_merge_request.py`, `azure_devops_pull_request.py`, and
+`bitbucket_pull_request.py`): all adapters emit the same exact bounded canonical
+pull-request facts and stable error taxonomy. Before any supported provider target
+is persisted, `monitoring/targets.py` applies the shared credential scanner to its
+canonical URL and rejects credential-shaped path text rather than storing or later
+surfacing a redaction marker. This is an inbound gate, not an egress sink. GitLab
+accepts `gitlab.com` plus
+only exact operator-configured self-managed hosts and rechecks that allowlist on
+each probe; self-managed calls carry an explicit empty `GITLAB_TOKEN` scrub
+sentinel through environment construction so the shared minimal-environment
+builder cannot reintroduce the ambient token. GitLab
+and Azure execute only validated absolute `glab`/`az` binaries with minimal
+provider-scoped environments. The shared CLI transport strips ambient SSH and
+language-runtime injection variables (including Python, virtualenv, Conda, and
+Node search paths), replaces inherited `PATH` with the platform's trusted system
+path when one exists, and routes the validated argv through
+`sandboxed_spawn_argv(mode="standard")` from the filesystem root. The sandbox's
+general environment scrub runs first; the transport then restores only credentials
+explicitly scoped to that provider invocation. It drains stdout/stderr concurrently
+into fixed byte ceilings. Crossing a ceiling terminates and reaps the sandboxed
+process tree instead of buffering or orphaning the remainder. Process exit and both
+pipe joins retain independent finite deadlines, including after a timeout or a
+descendant that inherited a pipe. Each probe loads one credential snapshot with
+environment propagation disabled and threads that mapping through its supplemental
+reads; a read-only monitor therefore cannot widen the gateway's ambient environment
+or race another `os.environ.copy()`. GitLab's
+ambient-token decision is the same shared
+host-policy predicate used by the dashboard source panel, so self-managed hosts
+cannot drift onto the gitlab.com-token path. The transport also enforces fixed
+timeouts, disabled Azure extension dynamic installation, a shared four-probe
+concurrency ceiling, and credential-free lifecycle audit records. Azure accepts only
+`dev.azure.com`; its optional `AZURE_DEVOPS_EXT_PAT` is loaded from the protected
+credential file and is denied to agent subprocesses. Bitbucket accepts only
+`bitbucket.org` targets and constructs requests under the fixed
+`api.bitbucket.org/2.0` root; responses are size- and timeout-bounded. Optional
+`BITBUCKET_EMAIL` and `BITBUCKET_API_TOKEN` credentials are used only to build the
+HTTPS Authorization header and are never placed in argv, monitor state, logs, or
+browser payloads. Azure DevOps Server and Bitbucket Data Center URLs fail before
+credentials or network access.
+
+Pod environments scrub the loader's complete credential roster, including the
+Azure DevOps and Bitbucket source-provider credentials, before an isolated gateway
+or arbitrary `pod exec` command can inherit it. The only roster exceptions are
+`KIRO_API_KEY`, which the pod's agent needs for model access, and
+`KIROCREW_OWNER_ID`, which identifies the pod dashboard owner rather than an
+external service identity.
+
+Every provider head revision is either absent or bounded hexadecimal text before
+canonicalization, persistence, or prompt construction. Azure target parsing
+accepts canonical `%20` escapes in project and repository segments while keeping
+path separators, queries, fragments, and noncanonical encodings denied. The
+fixed-argv Azure provider process explicitly receives and exposes only its resolved
+`AZURE_CONFIG_DIR` and `AZURE_EXTENSION_DIR` (defaulting beneath the gateway user's
+`~/.azure`) through
+the otherwise-standard sandbox, so the documented `az login` credential store
+works without making those directories visible to agent subprocesses. Outside a
+pod, both paths must resolve at or beneath the protected canonical `HOME/.azure`
+tree; a relocated `KIROCREW_HOME` is not an alternate credential root. A pod accepts
+only paths beneath its disposable `KIROCREW_HOME`, where startup has scrubbed the
+provider credentials. Relative, escaping, and symlinked-out overrides fail before
+the sandbox receives a visibility exception. The minimal
+network environment includes HTTP(S), SOCKS/`ALL_PROXY`, and the standard requests,
+curl, and SSL certificate-bundle variables needed by provider CLIs behind corporate
+proxies, without forwarding unrelated gateway credentials.
+Pods override `GH_CONFIG_DIR`, `GLAB_CONFIG_DIR`, `AZURE_CONFIG_DIR`, and
+`AZURE_EXTENSION_DIR` with roots beneath the
+ephemeral pod home before any provider command runs. This keeps the live
+gateway's provider logins available to its own monitor probes while preventing a
+pod from inheriting the operator's persisted GitHub, GitLab, or Azure CLI identity through
+the intentionally shared process `HOME`; `pod down` reclaims all of those stores.
+
+Azure status and policy display labels and Bitbucket build-status labels are
+provider-controlled text. The adapters replace them with stable, namespaced SHA-256
+identities before they enter canonical state, fingerprints, persistence, or a wake
+envelope; the display labels themselves never reach an unattended agent prompt.
+
 Sidebar status follows the same read-only boundary. `GET /api/chat/slots` and the WebSocket handshake schedule provider refreshes and opt into cached `ci`/`state` fields only for an exact configured-owner request, or for signed `local-app`/`local-startup` dashboard subjects when no owner is configured. Generic slot serialization omits those fields. `DashboardState` tracks owner-authorized WebSockets separately, sends generic slot updates to all authenticated clients, then overlays credential-backed status only to the owner subset. This prevents a cache populated by an owner request from being replayed to a non-owner or app-token caller. Review-thread cache removal, generation advancement, and stale in-flight detachment still complete after thread ownership validation and before mutation dispatch, so cancellation cannot preserve or repopulate pre-mutation data.
 
 **Stale pre-owner sessions must re-authenticate (`stale_session_reauth`)**: a dashboard token's subject is fixed at mint time as `owner_id or <bootstrap subject>`, and both `POST /api/auth/refresh` and the one-time-link exchange re-mint from the INCOMING subject, so a session signed in before `KIROCREW_OWNER_ID` was configured carries `local-app`/`local-startup` for its whole life. Setting or changing `KIROCREW_OWNER_ID` therefore requires every pre-existing dashboard session to re-authenticate: once an owner exists, the owner gate denies the bootstrap subjects, and that denial is the control working — re-accepting them would readmit every machine-local token to an owner-locked dashboard. The operator surprise comes from `owner_id` being overloaded: it is collected as the Slack Member ID for owner DM routing, but it is also the dashboard authorization principal and the token subject, so setting it for Slack DMs also rotates the dashboard's identity anchor. To make the remedy discoverable, every owner-gate deny site that fronts the shared owner predicate (`stale_owner_session_response` in `source_providers.py`, consulted by the chat mode/approve/worktree/followup gate, the source-provider routes, cloud provisioning, MCP-app calls, `ask_question`, the browser mutations, agent-config mutations, the AWS consent gate, and the instances federated search) labels exactly this case `401 {"code": "stale_session_reauth"}` instead of the generic `403 forbidden`, and the dashboard turns that signal into a sign-in-again banner that deliberately skips the silent-refresh path (refresh preserves the stale subject, so it can never recover this denial); direct-fetch surfaces that bypass the blessed transport (the app-sdk scoped API, the MCP-app tool relay, Mochi's approval bridge) raise the same prompt through the shared `staleOwnerSignal` detector. CHANGING an already-set owner also invalidates the previous owner's sessions, but those carry the old owner's subject — an ordinary non-owner now — so they keep the generic denial: the distinct label is only derivable for the bootstrap subjects, whose staleness is provable from the subject alone. The label is chosen strictly AFTER the deny decision — access is never granted, widened, or re-ordered — and only for an ALREADY-AUTHENTICATED dashboard-user caller whose signed subject is a bootstrap subject while an owner is configured; unsigned, invalid, app-token, and ordinary non-owner callers keep the generic denial, so the discriminator discloses nothing to an unauthenticated party.

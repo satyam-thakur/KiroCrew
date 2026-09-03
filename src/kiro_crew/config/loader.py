@@ -359,6 +359,9 @@ CRED_WEIXIN_TOKEN = "WEIXIN_TOKEN"  # iLink bot credential from the Settings QR 
 CRED_FEISHU_APP_ID = "FEISHU_APP_ID"  # Feishu custom-app id (developer console)
 CRED_FEISHU_APP_SECRET = "FEISHU_APP_SECRET"
 CRED_JIRA_API_TOKEN = "JIRA_API_TOKEN"  # Jira Cloud/Server API token (resolved from .env)
+CRED_AZURE_DEVOPS_EXT_PAT = "AZURE_DEVOPS_EXT_PAT"
+CRED_BITBUCKET_EMAIL = "BITBUCKET_EMAIL"
+CRED_BITBUCKET_API_TOKEN = "BITBUCKET_API_TOKEN"
 # kiro-cli's OWN model credential. Unlike the gateway-owned channel tokens
 # above, its rightful consumer is the agent subprocess itself (and the whoami
 # identity probe), so it is deliberately NOT in sandbox._AGENT_DENIED_ENV_KEYS:
@@ -381,6 +384,9 @@ _CREDENTIAL_KEYS = (
     CRED_FEISHU_APP_ID,
     CRED_FEISHU_APP_SECRET,
     CRED_JIRA_API_TOKEN,
+    CRED_AZURE_DEVOPS_EXT_PAT,
+    CRED_BITBUCKET_EMAIL,
+    CRED_BITBUCKET_API_TOKEN,
     CRED_KIRO_API_KEY,
 )
 
@@ -3969,7 +3975,7 @@ class KiroCrewConfig:
                 return ad.get("model") or ""
         return ""
 
-    def load_credentials(self) -> dict[str, str]:
+    def load_credentials(self, *, propagate: bool = True) -> dict[str, str]:
         """Load credentials from ~/.kiro/crew/.env and environment variables.
 
         .env format: KEY=VALUE (one per line, # comments, no quotes required).
@@ -4041,13 +4047,14 @@ class KiroCrewConfig:
         # Children that need the withheld credentials get them via their own
         # .env read or via an explicit env= kwarg on Popen (the sandbox and ACP
         # spawners already do this).
-        scrubbed = bool(os.environ.get("_KIROCREW_CREDS_SCRUBBED"))
-        for k, v in creds.items():
-            if not v:
-                continue
-            if scrubbed and (k in _CREDENTIAL_KEYS or _JIRA_TOKEN_RE.match(k)):
-                continue
-            os.environ.setdefault(k, v)
+        if propagate:
+            scrubbed = bool(os.environ.get("_KIROCREW_CREDS_SCRUBBED"))
+            for k, v in creds.items():
+                if not v:
+                    continue
+                if scrubbed and (k in _CREDENTIAL_KEYS or _JIRA_TOKEN_RE.match(k)):
+                    continue
+                os.environ.setdefault(k, v)
 
         return creds
 

@@ -1,14 +1,18 @@
 # Monitoring pull requests and changing work
 
-Kiro Crew can watch a public GitHub pull request until it is review-ready while
-keeping model use proportional to real changes. Cheap status probes run on a
-schedule; the owning conversation wakes only when new evidence needs action.
+Kiro Crew can watch a GitHub, GitLab, Azure DevOps, or Bitbucket Cloud pull
+request until it is review-ready while keeping model use proportional to real
+changes. Cheap status probes run on a schedule; the owning conversation wakes
+only when new evidence needs action.
 
 ## Start a pull-request monitor
 
 In a dashboard, Slack, or Discord conversation, ask Kiro Crew to babysit or
-monitor the full pull-request URL. The supported first release watches public
-`github.com` pull requests for the `review_ready` objective.
+monitor the full pull-request URL. Structured monitoring supports GitHub pull
+requests, GitLab merge requests, Azure DevOps Services pull requests, and
+Bitbucket Cloud pull requests for the `review_ready` objective. Self-managed
+GitLab hosts must be present in the operator's `dashboard.gitlab_hosts`
+allowlist; Azure DevOps Server and Bitbucket Data Center are not supported.
 
 The default monitor is finite:
 
@@ -72,8 +76,9 @@ governance and approval policy for its conversation.
 
 ## Unsupported targets use the costly legacy loop
 
-Tickets, deployments, other forges, and custom objectives are not yet structured
-monitor kinds. Kiro Crew can use a legacy same-session goal loop for them, but
+Tickets, deployments, unsupported forges, and custom objectives are not yet
+structured monitor kinds. Kiro Crew can use a legacy same-session goal loop for
+them, but
 every delivered check is a full agent turn. It extends the conversation context
 and spends model and tool tokens even when the target did not change.
 

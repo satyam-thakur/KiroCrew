@@ -4493,6 +4493,21 @@ async def close_slot(
     *,
     pre_pop_check: Callable[[], None] | None = None,
 ) -> None:
+    """Close a slot while releasing its admission fence on every aborted path."""
+    try:
+        await _close_slot(state, slot, name, pre_pop_check=pre_pop_check)
+    finally:
+        if state.get_slot(name) is slot:
+            slot._closing = False
+
+
+async def _close_slot(
+    state: DashboardState,
+    slot: "_ChatSlot",
+    name: str,
+    *,
+    pre_pop_check: Callable[[], None] | None = None,
+) -> None:
     """Close (archive) one live slot the way the tab ✕ does: tombstone it, retire
     its auto-nudge loop, notify its owning app, persist it as closed, and tear
     down the per-tab session.
@@ -4537,6 +4552,10 @@ async def close_slot(
     # closed_at below — the save runs after the cancellation awaits, and
     # stamping save time would make channel activity landing in that window
     # compare as older than the close.
+    # Fence monitor admission for this exact slot generation before retirement:
+    # terminal replacement is otherwise allowed and could commit after this
+    # close observed the already-terminal record, leaving an active orphan.
+    slot._closing = True
     closed_at = note_slot_closed(state, name)
     # Retire the auto-nudge loop BEFORE the awaits below, so no nudge can expire
     # into the session being closed and resurrect it. See
@@ -4551,6 +4570,7 @@ async def close_slot(
         # the same way a failed history save does — the tab stays open and driven,
         # which is a state the user can see and retry, unlike a closed tab that
         # quietly wakes up later.
+        slot._closing = False
         await _restore_slot_nudge_loop(exc.loop, lambda: state.get_slot(name) is slot)
         logger.error("Failed to retire nudge loop for slot %s, close aborted", name)
         _sync_dashboard_slots(state)
@@ -4593,6 +4613,7 @@ async def close_slot(
         if not await notify_slot_closed(slot._app, name):
             # The app could not record the dismissal. Refuse the close rather
             # than leave a worker running behind a tab the user believes is gone.
+            slot._closing = False
             await _restore_slot_nudge_loop(retired_loop, lambda: state.get_slot(name) is slot)
             logger.error("Slot-close hook for app %r failed on %r, close aborted", slot._app, name)
             _sync_dashboard_slots(state)
@@ -4606,6 +4627,7 @@ async def close_slot(
         try:
             late_retired_loop = await _retire_slot_nudge_loop(name)
         except _NudgeRetireFailed as exc:
+            slot._closing = False
             await _restore_slot_nudge_loop(exc.loop, lambda: state.get_slot(name) is slot)
             from kiro_crew.apps.teardown import (
                 notify_slot_close_undone,  # circular: apps.teardown -> apps.bridges
@@ -4636,6 +4658,7 @@ async def close_slot(
         try:
             pre_pop_check()
         except SlotCloseError:
+            slot._closing = False
             await _restore_slot_nudge_loop(retired_loop, lambda: state.get_slot(name) is slot)
             if slot._app:
                 from kiro_crew.apps.teardown import (
@@ -4783,6 +4806,8 @@ async def close_slot(
         # replacement that kept the key. This arm never reaches the discard below
         # the save, so it settles the marker itself.
         _resettle_restricted_key(state, name)
+        # Keep monitor admission fenced until every rollback await completes.
+        # ``close_slot`` releases the fence in its outer finally.
         # The close did not happen, so the loop retired for it must come back —
         # a restored session with no clock is an abandoned unattended worker.
         await _restore_slot_nudge_loop(retired_loop, lambda: state.get_slot(name) is slot)
@@ -8687,115 +8712,4 @@ async def api_chat_slot_note(request: web.Request) -> web.Response:
         return bad
 
     # Default an empty, absent, or whitespace-only source to "note" so the drain
-    # frame reads [Background context from "note"] rather than empty quotes.
-    source = _normalize_source(body.get("source")) or "note"
-
-    # Ownership was decided before the body read. Re-decide it here, against the
-    # slot as it is NOW, because that await is long enough for a rebind.
-    stale = _reauthorize_after_await(state, slot, name, request_app, "note_post")
-    if stale is not None:
-        return stale
-
-    # A turn in flight owns the tail of the transcript: the replay path skips
-    # exactly one recall-eligible row to drop the current-turn user message, and
-    # an `inject` row appended now would take that slot and get skipped in its
-    # place, replaying the user's request twice. So the visible line is HELD and
-    # written at the turn's end, which is why `appended` is reported separately.
-    # This is decided BEFORE either write: a note rejected for a full hold must
-    # not leave its context half behind to reach the next turn anyway.
-    deferred = slot.running or slot._in_stage_execution
-    if deferred and len(slot._deferred_notes) >= _MAX_DEFERRED_NOTES:
-        return web.json_response(
-            {
-                "error": f"slot already holds {_MAX_DEFERRED_NOTES} deferred notes",
-                "code": "deferred_notes_full",
-            },
-            status=429,
-        )
-
-    # The per-source cap protects the context QUEUE, not the transcript. So when
-    # the context half is capped we still write the VISIBLE line -- the audit
-    # record the caller came for -- and report contextSkipped=true, rather than
-    # 429-ing the whole request and losing the visible note too. This matters
-    # most for the default source="note" bucket, which every sourceless caller
-    # shares. An omitted maxAge takes this endpoint's 24h default; an explicit
-    # null means no expiry, the same as it does on /context.
-    context_skipped = False
-    context_entry: dict[str, object] | None = None
-    if _source_cap_reached(slot, source):
-        context_skipped = True
-    else:
-        max_age = body.get("maxAge", _UNSET)
-        if max_age is _UNSET:
-            max_age = _NOTE_CONTEXT_MAX_AGE
-        context_entry, err = _build_pending_context_entry(
-            slot, content, source, body.get("ephemeral", True), max_age
-        )
-        if err is not None:
-            return err
-        assert context_entry is not None
-        # A held note's context is queued by the flush, not here. The drain runs
-        # inside the turn and after its task is assigned, so an entry queued now
-        # is read by the turn already running -- the note would shape the request
-        # it was written after, and the next turn would find nothing.
-        if not deferred:
-            # Both immediate halves resolve their destination LATE, so each
-            # records the session it was authorized against -- same reason the
-            # deferred arm below does, and checked at those later seams.
-            context_entry["noteSession"] = effective_session_key(slot)
-            slot.append_pending_context(context_entry)
-
-    # Caller-controlled content reaching the visible transcript (SSE plus the
-    # on-disk JSONL). Redact at this sink so a secret or exfil URL cannot land
-    # in user-visible history. The context half stays raw: that is the
-    # trusted-caller boundary inherited from /context. Order matters -- exfil
-    # URLs first, since that pass collapses the whole URL.
-    visible_content, _ = redact_exfiltration_urls(content)
-    visible_content, _ = redact_credentials(visible_content)
-    if deferred:
-        slot._deferred_notes.append(
-            {
-                "content": visible_content,
-                "cls": "reconcile-note",
-                "context": context_entry,
-                # The session this note was authorized against. The gate above
-                # only admits a slot that still routes to its own session, but
-                # an unbound slot can acquire a foreign binding while the note
-                # is held, and the flush resolves its target late.
-                "session": effective_session_key(slot),
-            }
-        )
-    else:
-        slot.append(
-            role="inject",
-            content=visible_content,
-            cls="reconcile-note",
-            broadcast=True,
-            meta={"noteSession": effective_session_key(slot)},
-        )
-
-    sel().log_api_access(
-        caller=request_app or request.get("user", "dashboard"),
-        operation="note_post",
-        outcome="ok",
-        source="app_kit",
-        resources=f"slot={name}",
-    )
-
-    # A hold is delivered only if the slot still routes to the same session at
-    # flush; a rebind during the hold drops it. An IMMEDIATE note is equally
-    # conditional while the slot is UNBOUND, because both halves resolve their
-    # destination late and every binding site claims an EMPTY binding
-    # (``if not slot.linked_session_key``) -- so an already-bound slot cannot be
-    # re-claimed and its immediate note is genuinely unconditional.
-    delivery_conditional = deferred or not slot.linked_session_key
-    return web.json_response(
-        {
-            "ok": True,
-            "appended": not deferred,
-            "visibleDeferred": deferred,
-            "deliveryConditional": delivery_conditional,
-            "contextSkipped": context_skipped,
-            "pending": len(slot._pending_context) + slot.deferred_context_count(),
-        }
-    )
+    # frame reads [Background context from "note"] rather than e

@@ -30,7 +30,7 @@ from types import SimpleNamespace
 import pytest
 
 import kiro_crew.autonudge_authz as autonudge_authz
-from kiro_crew.autonudge import binding_key_for
+from kiro_crew.autonudge import NudgeAdmissionRefused, binding_key_for
 from kiro_crew.autonudge_authz import authorize_and_add_nudge
 from kiro_crew.workflows.service import WorkflowService
 
@@ -312,7 +312,7 @@ class FakeNudgeSvc:
         gate=True,
     ):
         if admission_check is not None and not admission_check():
-            raise AssertionError("test admission unexpectedly changed")
+            raise NudgeAdmissionRefused("session changed before nudge arm committed")
         self.added.append((slot_key, message, idle_secs, max_cycles))
         self.banners: list[str] = getattr(self, "banners", [])
         self.banners.append(banner)
@@ -345,6 +345,22 @@ async def test_authz_rejects_unknown_dashboard_slot() -> None:
     )
     assert loop is None and status == 404 and "unknown slot" in error
     assert svc.added == []  # never armed
+
+
+async def test_authz_rejects_dashboard_slot_during_close() -> None:
+    svc = FakeNudgeSvc()
+    slot = SimpleNamespace(workspace="default", _closing=True)
+
+    loop, error, status = await authorize_and_add_nudge(
+        svc=svc,
+        state=_state(slots={"chat-1-1": slot}),
+        slot_key="chat-1-1",
+        message="watch",
+        source="dashboard",
+    )
+
+    assert loop is None and status == 409 and "session changed" in error
+    assert svc.added == []
 
 
 async def test_authz_rejects_message_too_long() -> None:

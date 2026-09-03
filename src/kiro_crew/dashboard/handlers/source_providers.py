@@ -46,6 +46,7 @@ from kiro_crew.github_runner import (
 )
 from kiro_crew.github_runner import STRICT_PROVIDER_BIN_ENV as _STRICT_PROVIDER_BIN_ENV
 from kiro_crew.github_runner import (
+    gitlab_ambient_token_allowed,
     provider_executable_candidates,
 )
 from kiro_crew.github_runner import strict_provider_bins as _strict_provider_bins
@@ -1544,7 +1545,7 @@ async def _run_provider(
         raise
 
     allowed_env_keys = _PROVIDER_BASE_ENV_KEYS | _PROVIDER_AUTH_ENV_KEYS[executable]
-    if executable == "glab" and gitlab_host != "gitlab.com":
+    if executable == "glab" and not gitlab_ambient_token_allowed(gitlab_host):
         # GITLAB_TOKEN is a single ambient credential with no host binding, so
         # forwarding it while GITLAB_HOST points at a self-managed instance would
         # send a gitlab.com PAT (and every permission it carries) to that server.
