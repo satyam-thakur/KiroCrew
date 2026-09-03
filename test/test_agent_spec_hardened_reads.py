@@ -908,7 +908,14 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
     "kiro_crew/dashboard/handlers/agents.py": [
         ("api_agent_detail", "dashboard"),
         ("api_agent_detail", "dashboard"),
+        # PATCH's locked overwrite re-reads the spec INSIDE agents_spec_lock so
+        # the merge+sanitize applies to the current disk state, not a stale
+        # pre-lock snapshot (GPT round-9 governance finding).
+        ("api_agent_detail", "dashboard"),
         ("api_agents_sync", "dashboard"),
+        # The fork/publish endpoints share _load_template_specs, which forwards
+        # its ``operation`` argument -- each caller still names itself.
+        ("forward:operation", "dashboard"),
     ],
     "kiro_crew/dashboard/handlers/hooks.py": [("api_kiro_hooks", "dashboard")],
     "kiro_crew/dashboard/handlers/mcp.py": [
