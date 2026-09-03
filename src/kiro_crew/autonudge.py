@@ -2141,6 +2141,31 @@ class AutoNudgeService:
         self._emit("updated", loop)
         return decision
 
+    async def stop_monitor_if_budget_exhausted(
+        self,
+        monitor_id: str,
+        *,
+        now: float,
+    ) -> bool:
+        """Stop a spent structured monitor before starting another provider probe."""
+        stopped_loop: NudgeLoop | None = None
+        async with self._lock:
+            loop = self._loops.get(monitor_id)
+            state = loop.monitor if loop is not None else None
+            if loop is not None and state is not None and loop.active and state.outcome is None:
+                reason = monitor_budget_reason(state, now=now)
+                if reason:
+                    stopped = deepcopy(loop)
+                    if stopped.monitor is not None:
+                        stopped.monitor.last_decision = MonitorDecision.STOP_BUDGET
+                    self._apply_monitor_budget_stop(stopped, reason, stopped_at=now)
+                    await self._persist_staged_monitor_locked(loop, stopped)
+                    self._sync_terminal_completion_timer(loop)
+                    stopped_loop = loop
+        if stopped_loop is not None:
+            self._emit("updated", stopped_loop)
+        return stopped_loop is not None
+
     def _set_monitor_deadline(self, loop: NudgeLoop, deadline: float) -> None:
         """Write the scheduler authority and inspection mirror together."""
         loop.next_due_ts = deadline

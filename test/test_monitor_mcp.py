@@ -9,6 +9,14 @@ from kiro_crew import mcp_core, session_directive
 from kiro_crew.mcp_tools import control
 
 
+def test_monitor_watch_only_names_the_nondefault_evidence_scope():
+    schema = next(item for item in control.schemas() if item["name"] == "monitor_watch")
+
+    assert schema["inputSchema"]["properties"]["evidence_scope"]["enum"] == [
+        "provider_facts_and_comments"
+    ]
+
+
 def test_monitor_watch_is_stateless_and_canonical():
     with patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value="dashboard:chat-1"):
         result = control.monitor_watch(
@@ -25,6 +33,28 @@ def test_monitor_watch_is_stateless_and_canonical():
     assert args["target"] == "https://github.com/acme/widgets/pull/7"
     assert "session_key" not in json.dumps(args)
     assert "loop_id" not in json.dumps(args)
+
+
+def test_monitor_watch_routes_comment_dependent_readiness_to_legacy_loop():
+    audit = MagicMock()
+    with (
+        patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value="dashboard:chat-1"),
+        patch("kiro_crew.mcp_core.sel", return_value=audit),
+    ):
+        result = control.monitor_watch(
+            "monitor_watch",
+            {
+                "kind": "github_pull_request",
+                "target": "https://github.com/acme/widgets/pull/7",
+                "objective": "review_ready",
+                "evidence_scope": "provider_facts_and_comments",
+            },
+        )
+
+    assert result.startswith("Error:")
+    assert "monitor_start" in result
+    assert session_directive.decode(result, "monitor_watch") is None
+    assert audit.log_tool_invocation.call_args.kwargs["outcome"] == "denied"
 
 
 def test_monitor_watch_rejects_native_subagent_binding():
@@ -169,6 +199,7 @@ def test_monitor_inspect_passes_strict_identity_without_fallback():
                     "kind": "github_pull_request",
                     "created_ts": 123.0,
                     "wake_count": 3,
+                    "token_usage_known": False,
                     "wake_instructions": "large prompt omitted from inspect",
                     "last_wake_reason_code": "checks_failed",
                     "user_stop_reason": "operator stopped",
@@ -192,6 +223,7 @@ def test_monitor_inspect_passes_strict_identity_without_fallback():
     assert payload["monitor"]["wake_count"] == 3
     assert payload["monitor"]["last_wake_reason_code"] == "checks_failed"
     assert payload["monitor"]["user_stop_reason"] == "operator stopped"
+    assert payload["monitor"]["token_usage_known"] is False
     assert payload["monitor"]["last_observation_status"] == "pending"
     assert payload["monitor"]["last_observation_reason_code"] == "checks_pending"
     assert "last_observation_summary" not in payload["monitor"]
