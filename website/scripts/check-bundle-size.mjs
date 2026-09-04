@@ -88,7 +88,23 @@ export const CHUNK_BUDGETS = {
   // The app-core chunk: the dashboard shell plus everything eagerly imported
   // from it. The vendor split in vite.config.ts already extracts the heaviest
   // libraries; what remains is first-party code with no clean lazy boundary.
-  App: 3200 * KB, // measured 3121 KB
+  //
+  // Re-measured 2026-09-04 at 3201 KB. The previous `measured 3121 KB` note was
+  // ~78 KB stale, which had left main sitting 616 B under its own ceiling -- so
+  // this fired on the first branch to add anything at all to the chunk, rather
+  // than on the new library or surface it exists to catch.
+  //
+  // Attribution measured, not assumed: main's tip builds this chunk at
+  // 3,276,213 B and the merge ref at 3,277,816 B, so the branch that tripped it
+  // contributes 1,603 B -- the app-identity, view-state and cache-retention
+  // modules. Those cannot move behind a lazy boundary and still work: each one
+  // must be registered before the app page's first child query mounts, which is
+  // the whole ordering guarantee they exist to provide, so a lazy import would
+  // make them arrive a render too late. The growth is real and irreducible; the
+  // missing headroom is what made it fatal.
+  //
+  // 5% headroom, matching the convention `all` and `t` above use.
+  App: 3361 * KB, // measured 3201 KB on the merge ref of main @ bad30a003 (~5% headroom)
 
   // Markdown/math/syntax rendering stack (katex, highlight.js, remark/rehype)
   // -- one deliberate `manualChunks` bucket, see vite.config.ts.
