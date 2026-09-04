@@ -31,6 +31,7 @@ import { SourceBadge } from '../components/SourceBadge'
 import { errMessage } from '../utils/thunkError'
 import { EFFORT_LEVELS, effortLabel, modelSupportsEffort } from '../lib/effort'
 
+import { useConfirm } from '../components/ConfirmDialog'
 import { i18nT } from '../i18n/t'
 import ErrorNotice from '../components/ErrorNotice'
 /** Common shape returned by the agent/workspace mutation endpoints. */
@@ -821,6 +822,10 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
 
   const closeSheet = useCallback(() => { sheetEpoch.current += 1; setSheet(null); setError(''); setConfirmDelete(false) }, [])
 
+  /** Async discard confirm for the editor's dismissal paths. `confirmOpen` is
+   *  read below so a dismissal while the confirm is up does not re-ask. */
+  const { confirm, confirmDialog, confirmOpen } = useConfirm()
+
   /**
    * Identity of the CURRENT panel opening, bumped on every open and every
    * close.
@@ -1034,8 +1039,11 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     setPane(key)
   }, [schedDraft, pane])
 
-  /** Editor dismissal (footer Cancel, Escape, overlay click) routes through
-   *  here: same draft, same guard, same reason as the pane switch above. */
+  /** The schedule-draft leg of editor dismissal (footer Cancel, Escape,
+   *  overlay click): same draft, same guard, same reason as the pane switch
+   *  above. attemptClose below fronts every dismissal path and routes here
+   *  when a draft is open; the closeSheet fall-through keeps this callable on
+   *  its own without re-testing the flag at each call site. */
   const requestClose = useCallback(() => {
     if (schedDraft) { setDiscardAsk('close'); return }
     closeSheet()
@@ -1145,6 +1153,33 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     if (schedDraft) out.add('schedules')
     return out
   }, [editingAgent, kiroAgent, workspace, memoryStore, editModel, editEffort, triggers, sessionColor, schedDraft])
+
+  /**
+   * Guarded dismissal for the editor's Cancel / Escape / overlay-click paths.
+   *
+   * A successful save closes through settleFor/closeSheet directly and must
+   * never route here — only user-initiated dismissal is guarded. The create
+   * form's dirtiness is not tracked by dirtyPanes (scoped `!creating`, matching
+   * the unsaved-changes note in the footer), so it always closes immediately.
+   *
+   * An open schedule draft keeps its OWN confirm via requestClose rather than
+   * this generic one, and is therefore tested FIRST — dirtyPanes contains
+   * 'schedules' while the draft is open, so the order is what decides which
+   * dialog the user sees. That confirm is not interchangeable with this one: it
+   * locks its destructive button while the draft's create POST is in flight
+   * (discarding cannot cancel the request) and unlocks it after a grace period,
+   * neither of which the shared useConfirm expresses.
+   */
+  const attemptClose = useCallback(async () => {
+    if (schedDraft) { requestClose(); return }
+    if (creating || dirtyPanes.size === 0) { closeSheet(); return }
+    const discard = await confirm({
+      title: i18nT('pages.kiroCrewAgentsPage.discard_unsaved_changes'),
+      body: i18nT('pages.kiroCrewAgentsPage.discard_unsaved_body'),
+      confirmLabel: i18nT('pages.kiroCrewAgentsPage.discard_confirm'),
+    })
+    if (discard) closeSheet()
+  }, [schedDraft, requestClose, creating, dirtyPanes, confirm, closeSheet])
 
   const sections = useCrewEditorSections({
     templateLabel: provider.labels.agentTemplateField,
@@ -1331,7 +1366,18 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
         )}
       </div>
 
-      <Dialog open={!!sheet} onOpenChange={next => { if (!next) requestClose() }}>
+      {/* While the discard confirm is open it owns Escape/outside-click; a
+          dismissal reaching the editor here would re-ask the guard the confirm
+          just raised, so it is ignored until the confirm settles.
+          modal is dropped while the confirm is up: the confirm is a body-portal
+          Modal outside this Radix DialogContent, so keeping Radix's focus scope
+          active would trap focus back onto Save behind the confirm and let
+          Enter persist the edits the confirm is asking to discard. Releasing
+          the scope hands focus to the confirm's own trap. The schedule-draft
+          confirm below needs neither guard: it is a nested Radix Dialog inside
+          this DialogContent, so Radix's own layering already keeps it on top
+          and keeps this editor from treating its Escape as a dismissal. */}
+      <Dialog open={!!sheet} modal={!confirmOpen} onOpenChange={next => { if (!next && !confirmOpen) attemptClose() }}>
         <DialogContent
           /* The rail needs horizontal room; the create form does not have one. */
           maxWidth={creating ? 560 : 790}
@@ -1592,7 +1638,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                   : i18nT('components.crewEditor.unsaved_changes')}
               </span>
             )}
-            <Btn onClick={requestClose}>{i18nT('pages.kiroCrewAgentsPage.cancel')}</Btn>
+            <Btn onClick={attemptClose}>{i18nT('pages.kiroCrewAgentsPage.cancel')}</Btn>
             {creating ? (
               <SendBtn onClick={create} disabled={sheetBusy}>
                 {createMut.isPending ? i18nT('pages.kiroCrewAgentsPage.creating') : i18nT('pages.kiroCrewAgentsPage.create')}
@@ -1666,6 +1712,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
           </Dialog>
         </DialogContent>
       </Dialog>
+      {confirmDialog}
     </>
   )
 }
