@@ -32,7 +32,7 @@ from kiro_crew.apps.execution import (
 from kiro_crew.apps.job_routes import register_job_routes
 from kiro_crew.apps.job_sdk import forget_sdk, get_sdk, reconcile_all, register_sdk
 from kiro_crew.apps.lifecycle import LifecycleDispatcher
-from kiro_crew.apps.manager import app_dir, list_apps
+from kiro_crew.apps.manager import app_dir, app_enabled_state, get_app, list_apps
 from kiro_crew.apps.route_registry import RouteRegistry
 from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable
 from kiro_crew.executors import subprocess_executor
@@ -43,6 +43,14 @@ logger = logging.getLogger(__name__)
 # Module-level singletons (initialized at gateway startup)
 _route_registry: RouteRegistry | None = None
 _lifecycle_dispatcher: LifecycleDispatcher | None = None
+
+#: How often the gateway re-reads ``installed.json`` to find apps that were torn
+#: down out-of-process. Matches ``backend._HEALTH_WATCH_INTERVAL``, which sweeps
+#: the same metadata for the same reason on the backend-process side.
+_TEARDOWN_SWEEP_INTERVAL = 15.0
+
+#: The sweep task, armed at gateway startup and cancelled at cleanup.
+_teardown_sweep_task: asyncio.Task[None] | None = None
 
 # Last hook-wiring health per app, for apps whose hooks did NOT come up clean.
 # ``AppHealthStatus`` lives on the AppContext, which both wiring paths drop as
@@ -490,6 +498,143 @@ async def on_app_disable(
     forget_sdk(app_name)
 
     return result
+
+
+async def reconcile_torn_down_apps() -> list[str]:
+    """Undo the hook registration of every app that is no longer enabled on disk.
+
+    ``RouteRegistry`` is an in-memory table in the GATEWAY process, and
+    ``deregister_app_routes`` is reached only from ``on_app_disable`` on the
+    gateway's own teardown path. ``kirocrew app disable`` and ``kirocrew app
+    uninstall`` run in a DIFFERENT process: they write ``installed.json`` (and,
+    for uninstall, delete the app), report success, and never reach this
+    registry. The app's routes therefore keep dispatching -- and its module stays
+    in ``sys.modules`` -- for the rest of the gateway's life (#7926).
+
+    This closes it the way the backend-process side already does: re-read the
+    authoritative metadata and undo the registration, rather than leave the entry
+    in place behind a per-request check. ``backend._set_backend_health`` reads the
+    same ``app_enabled_state`` on every health sweep and calls
+    ``_drop_disabled_app_resources`` on a confirmed disable, whose docstring
+    already records that it is "idempotent with the CLI's own deregistration" --
+    that mechanism exists precisely because the CLI is out of process. It only
+    ever visits apps with a spawned backend, so an app whose backend surface is
+    ``hooks.routes`` alone is never swept by it.
+
+    A hidden route is not a removed route, so this REMOVES the registration:
+    ``on_app_disable`` pops the routing table entry, drops the AppContext,
+    unloads the app's modules, clears its hook health and forgets its job SDK.
+    The entry is gone, not filtered.
+
+    ``run_app_hooks=False``, for the reason that flag exists: the app's
+    ``on_shutdown`` is third-party code, and starting it as part of undoing a
+    teardown the operator already performed would make the cleanup an execution
+    vector. Everything the GATEWAY owns still runs -- nothing that STOPS
+    something is skipped.
+
+    Acts only on a CONFIRMED ``False``. ``app_enabled_state`` is tri-state and
+    answers ``None`` when ``installed.json`` cannot be READ (EMFILE, EIO, a
+    Windows AV lock); tearing down on that would take a live app's routes offline
+    over a momentary fault, so an unreadable state leaves the registration
+    standing and is retried on the next sweep. A MISSING metadata file is a
+    definite ``False`` -- that is the uninstall case.
+
+    Returns the app names torn down, for logging and for tests.
+    """
+    if _route_registry is None:
+        return []
+    torn_down: list[str] = []
+    for name in list(_route_registry.get_registered_apps()):
+        # Both reads touch the filesystem; keep them off the loop.
+        state = await asyncio.to_thread(app_enabled_state, name)
+        if state is not False:
+            continue
+        # get_app returns None once the app is uninstalled and its manifest is
+        # gone. on_app_disable reads app_info only to find hooks (whose
+        # on_shutdown is skipped here anyway) and permissions.cron (the CLI
+        # already cleaned those, and the gateway's timer re-syncs the store), so
+        # an empty manifest still reaches every teardown step that matters.
+        info = await asyncio.to_thread(get_app, name)
+        if not isinstance(info, dict):
+            info = {"name": name, "manifest": {}}
+        try:
+            await on_app_disable(name, info, run_app_hooks=False)
+        except Exception as exc:  # noqa: BLE001 - one bad app must not stop the sweep
+            logger.exception(
+                "App %s: could not undo the hook registration of a torn-down app", name
+            )
+            sel().log_api_access(
+                caller="gateway",
+                operation="app_hooks_teardown_sweep",
+                outcome="failed",
+                resources=name,
+                error=str(exc),
+            )
+            continue
+        # on_app_disable returns early without deregistering when a detached
+        # startup hook refuses to stop, so "it was called" is not proof the
+        # routes are gone. Report only what is verifiably no longer dispatchable.
+        if name in _route_registry.get_registered_apps():
+            logger.warning(
+                "App %s was torn down out-of-process but its routes are still "
+                "registered; retrying on the next sweep",
+                name,
+            )
+            continue
+        torn_down.append(name)
+        logger.warning(
+            "App %s was disabled or uninstalled by another process; the gateway has "
+            "stopped serving its routes and unloaded its modules",
+            name,
+        )
+        sel().log_api_access(
+            caller="gateway",
+            operation="app_hooks_teardown_sweep",
+            outcome="completed",
+            resources=name,
+        )
+    return torn_down
+
+
+async def _teardown_sweep_loop() -> None:
+    """Run :func:`reconcile_torn_down_apps` forever, one sweep per interval.
+
+    Never exits on a failed sweep: the whole point is that the exposure lasts
+    until something removes the registration, so a loop that died on a transient
+    fault would leave a torn-down app dispatchable for the rest of the gateway's
+    life -- exactly the bug it exists to close.
+    """
+    while True:
+        await asyncio.sleep(_TEARDOWN_SWEEP_INTERVAL)
+        try:
+            await reconcile_torn_down_apps()
+        # No CancelledError arm: it derives from BaseException, so `except
+        # Exception` already lets a cancellation from stop_teardown_sweep out.
+        except Exception:  # noqa: BLE001 - the sweep must outlive its own failures
+            logger.exception("App hook teardown sweep failed; retrying next interval")
+
+
+def start_teardown_sweep() -> None:
+    """Arm the out-of-process teardown sweep (idempotent)."""
+    global _teardown_sweep_task
+    if _teardown_sweep_task is not None and not _teardown_sweep_task.done():
+        return
+    _teardown_sweep_task = asyncio.create_task(_teardown_sweep_loop())
+    logger.info("App hook teardown sweep armed (every %.0fs)", _TEARDOWN_SWEEP_INTERVAL)
+
+
+async def stop_teardown_sweep() -> None:
+    """Cancel the sweep and await it, so an in-process restart leaks no task."""
+    global _teardown_sweep_task
+    task = _teardown_sweep_task
+    _teardown_sweep_task = None
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 async def on_gateway_startup(

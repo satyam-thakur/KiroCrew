@@ -434,6 +434,18 @@ version. Restart the Gateway, or disable and re-enable the app from the
 dashboard, for hook changes to take effect. The CLI prints this reminder after
 enabling any app that declares `backend.hooks`.
 
+**Teardown is not symmetric with that.** `kirocrew app disable` and `kirocrew app
+uninstall` are also out of process and also cannot reach a running Gateway's
+`RouteRegistry`, but here the Gateway closes the gap itself: it re-reads
+`installed.json` every 15 seconds and, for any app whose hooks are still
+registered while its metadata says not-enabled -- or the metadata is gone
+entirely -- runs the Gateway-owned half of that app's teardown: routes
+deregistered, modules unloaded, hook health cleared. So a CLI teardown does stop
+the app being served, within one sweep, with no restart. The app's own
+`on_shutdown` is deliberately NOT invoked on that path -- it is third-party code,
+and starting it to finish a teardown the operator already performed would make
+the cleanup an execution vector.
+
 **Importing your own modules.** Hook entry files are loaded from their file path
 into a synthetic package named after the app, never via `sys.path`, so use a
 **relative** import to reach a sibling module:

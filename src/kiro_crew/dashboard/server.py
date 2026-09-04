@@ -24,6 +24,8 @@ from kiro_crew.apps.hooks_integration import (
     init_hooks_system,
     on_gateway_shutdown,
     on_gateway_startup,
+    start_teardown_sweep,
+    stop_teardown_sweep,
 )
 from kiro_crew.apps.manager import cleanup_migrated_builtin, register_builtin_apps
 from kiro_crew.autonudge import get_instance as _autonudge_get
@@ -3316,6 +3318,11 @@ async def start_dashboard(
             broadcast_fn=_app_event_broadcast,
             spawn_impl=_app_spawn,
         )
+        # AFTER the boot registration, so the first sweep judges a table this
+        # gateway has already filled rather than an empty one. Undoes the hook
+        # registration of any app torn down by another process (the CLI), which
+        # cannot reach this process's RouteRegistry (#7926).
+        start_teardown_sweep()
         # App dev-mode live reload: watch dev-flagged apps' ui/ dirs and
         # broadcast app_reload WS events on change (see apps/dev_mode.py).
         from kiro_crew.apps.dev_mode import init_dev_mode_watcher
@@ -3325,6 +3332,10 @@ async def start_dashboard(
     app.on_startup.append(_hooks_startup)
 
     async def _hooks_shutdown(app_: web.Application) -> None:
+        # Before on_gateway_shutdown: the sweep tears apps down, and letting it
+        # fire concurrently with shutdown's own teardown would have two writers
+        # on the same registry.
+        await stop_teardown_sweep()
         await on_gateway_shutdown()
         # Cancel the app dev-mode watcher started in _hooks_startup so an
         # in-process gateway restart does not leak the module-global task (which
