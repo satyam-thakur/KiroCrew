@@ -88,7 +88,12 @@ export const CHUNK_BUDGETS = {
   // The app-core chunk: the dashboard shell plus everything eagerly imported
   // from it. The vendor split in vite.config.ts already extracts the heaviest
   // libraries; what remains is first-party code with no clean lazy boundary.
-  App: 3200 * KB, // measured 3121 KB
+  // measured 3121 KB; +2 KB when the subagent wave chip's stop-all failure
+  // path pulled ErrorNotice into the chat surface (reviewer-mandated:
+  // errors-use-error-notice is a blocking rule, so the growth is irreducible
+  // without lazy-loading a shared error primitive, which would flash on the
+  // exact path that reports failures).
+  App: 3210 * KB,
 
   // Markdown/math/syntax rendering stack (katex, highlight.js, remark/rehype)
   // -- one deliberate `manualChunks` bucket, see vite.config.ts.

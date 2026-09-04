@@ -9135,6 +9135,7 @@
         "s": "s",
         "stop": "Arrêter",
         "stop_all": "Tout arrêter",
+        "stop_all_failed_queued_may_still_start": "Échec de « Tout arrêter » — les sous-agents en file d’attente peuvent encore démarrer",
         "stop_all_running_subagents": "Arrêter tous les sous-agents en cours",
         "stop_running_subagent": "Arrêter le sous-agent en cours",
         "stop_subagent": "Arrêter le sous-agent {{name}}",

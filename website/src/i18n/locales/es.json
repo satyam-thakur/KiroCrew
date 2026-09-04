@@ -9135,6 +9135,7 @@
         "s": "s",
         "stop": "Detener",
         "stop_all": "Detener todos",
+        "stop_all_failed_queued_may_still_start": "Error al detener todo — los subagentes en cola aún podrían iniciarse",
         "stop_all_running_subagents": "Detener todos los subagentes en ejecución",
         "stop_running_subagent": "Detener el subagente en ejecución",
         "stop_subagent": "Detener el subagente {{name}}",
