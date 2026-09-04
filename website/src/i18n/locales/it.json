@@ -5077,6 +5077,12 @@
     "viewPr": "Pull request"
   },
   "components": {
+    "crashNotice": {
+      "diagnostics_were_saved_locally": "Nuovi record di arresto anomalo salvati su questo computer: {{n}}. Allegali quando segnali il problema.",
+      "dismiss": "Ignora",
+      "show_diagnostics": "Mostra diagnostica",
+      "the_app_closed_unexpectedly": "L’app si è chiusa in modo inaspettato"
+    },
     "crewWakeSection": {
       "active": "attivo",
       "cancel_new_schedule": "Annulla nuova pianificazione",

@@ -5162,6 +5162,12 @@
     "viewPr": "Пул-реквест"
   },
   "components": {
+    "crashNotice": {
+      "diagnostics_were_saved_locally": "На этом устройстве сохранено новых записей о сбоях: {{n}}. Приложите их к сообщению о проблеме.",
+      "dismiss": "Закрыть",
+      "show_diagnostics": "Показать диагностику",
+      "the_app_closed_unexpectedly": "Приложение неожиданно завершило работу"
+    },
     "crewWakeSection": {
       "active": "активно",
       "cancel_new_schedule": "Отменить новое расписание",

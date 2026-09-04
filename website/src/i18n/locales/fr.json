@@ -5077,6 +5077,12 @@
     "viewPr": "Pull request"
   },
   "components": {
+    "crashNotice": {
+      "diagnostics_were_saved_locally": "Nouveaux enregistrements de plantage enregistrés sur cet appareil : {{n}}. Joignez-les à votre signalement.",
+      "dismiss": "Ignorer",
+      "show_diagnostics": "Afficher les diagnostics",
+      "the_app_closed_unexpectedly": "L’application s’est fermée de manière inattendue"
+    },
     "crewWakeSection": {
       "active": "actif",
       "cancel_new_schedule": "Annuler la nouvelle planification",

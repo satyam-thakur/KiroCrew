@@ -4907,6 +4907,12 @@
     "viewPr": "拉取请求"
   },
   "components": {
+    "crashNotice": {
+      "diagnostics_were_saved_locally": "已在本机保存 {{n}} 条新的崩溃记录。反馈问题时请一并附上。",
+      "dismiss": "忽略",
+      "show_diagnostics": "查看诊断文件",
+      "the_app_closed_unexpectedly": "应用意外退出"
+    },
     "crewWakeSection": {
       "active": "运行中",
       "cancel_new_schedule": "取消新建定时任务",

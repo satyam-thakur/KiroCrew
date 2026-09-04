@@ -5077,6 +5077,12 @@
     "viewPr": "Solicitud"
   },
   "components": {
+    "crashNotice": {
+      "diagnostics_were_saved_locally": "Registros de fallo nuevos guardados en este equipo: {{n}}. Adjúntalos al informar del problema.",
+      "dismiss": "Descartar",
+      "show_diagnostics": "Mostrar diagnósticos",
+      "the_app_closed_unexpectedly": "La aplicación se cerró de forma inesperada"
+    },
     "crewWakeSection": {
       "active": "activo",
       "cancel_new_schedule": "Cancelar nueva programación",

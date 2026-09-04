@@ -171,6 +171,7 @@
       "gateway-recovery.js",
       "renderer-recovery.js",
       "native-logging.js",
+      "crash-collector.js",
       "disable-gpu.js",
       "memory-watch-log.js",
       "cage-trace.js",

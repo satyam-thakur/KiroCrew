@@ -4907,6 +4907,12 @@
     "viewPr": "プルリクエスト"
   },
   "components": {
+    "crashNotice": {
+      "diagnostics_were_saved_locally": "この端末に新しいクラッシュ記録を {{n}} 件保存しました。問題を報告する際に添付してください。",
+      "dismiss": "閉じる",
+      "show_diagnostics": "診断情報を表示",
+      "the_app_closed_unexpectedly": "アプリが予期せず終了しました"
+    },
     "crewWakeSection": {
       "active": "実行中",
       "cancel_new_schedule": "新しいスケジュールをキャンセル",

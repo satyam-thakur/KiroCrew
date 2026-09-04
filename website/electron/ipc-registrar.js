@@ -16,6 +16,7 @@ const {
 const { initAutoUpdate } = require("./auto-update");
 const { makeUpdaterLogger } = require("./update-logger");
 const { detectWsl2 } = require("./wsl-detection");
+const { crashNoticeSummary } = require("./crash-collector");
 
 /**
  * Register the Electron shell's renderer bridges without taking ownership of
@@ -30,6 +31,7 @@ function createIpcRegistrar({
   backendUrl,
   port,
   detectWsl = detectWsl2,
+  crashScan = null,
   glog,
   // Close/reopen the Crew Companion overlay around an update install so it does
   // not float orphaned over the vanished dashboard during the quit handoff.
@@ -52,6 +54,7 @@ function createIpcRegistrar({
     app,
     Notification,
     ipcMain,
+    shell,
     webContents,
   } = electron;
   const log = typeof glog === "function" ? glog : (() => {});
@@ -136,6 +139,79 @@ function createIpcRegistrar({
     ipcMain.handle("local-gateway:get", () => isLocalGatewayEnabled(store));
     ipcMain.handle("local-gateway:set", (_event, enabled) =>
       setLocalGatewayEnabled(store, enabled));
+
+    // Crash artifacts left by a previous run, so the dashboard can say "this
+    // happened" instead of leaving the user to discover it themselves.
+    //
+    // Sender-restricted for the same reason as `wsl:detect` below: a connection
+    // window pointed at a REMOTE gateway shares this preload, and whether the
+    // machine in front of the user crashed is a fact about that machine, not
+    // about the gateway the window is talking to.
+    //
+    // All THREE of `wsl:detect`'s gates, not two. An earlier version of this
+    // file stopped at gate 2, reasoning that gate 3 exists to withhold a host
+    // software inventory and that this payload is only a count and a timestamp.
+    // That reasoning does not survive `crash-reports:reveal`, which is not a
+    // read at all: it opens a file-manager window on the machine in front of the
+    // user. A manual SSH tunnel holding the primary port appears in no
+    // remote-host config, so gate 2 passes for it by construction (see
+    // `isGatewayLocalForWindow`, which can only consult configured hosts) — and
+    // a remote renderer would then be able to pop a local Finder/Explorer
+    // window and learn whether this machine has been crashing. Gate 3 is the
+    // only one that positively identifies the listener, so both channels take
+    // it.
+    const assertLocalDashboard = async (event, channel) => {
+      let origin = "";
+      try {
+        origin = new URL(event.senderFrame.url).origin;
+      } catch {
+        // about:blank, a malformed URL, or a torn-down frame is not a dashboard.
+      }
+      if (origin !== backendUrl) {
+        // Logged, not silent: the UI renders a rejection and "no crashes" the
+        // same way, so diagnostics must be able to tell them apart.
+        log(`${channel} rejected for sender origin ${origin || "(unreadable)"}`);
+        throw new Error(`${channel} is restricted to the local dashboard`);
+      }
+      const owner = windows.windowForWebContents(event.sender);
+      if (!windows.security.isGatewayLocalForWindow(owner)) {
+        log(`${channel} rejected for a sender window without a local gateway`);
+        throw new Error(`${channel} is restricted to the local dashboard`);
+      }
+      // Gate 3 — positive listener ownership. Foreign holders, an unbound port,
+      // and an unavailable probe all fail closed, exactly as in `wsl:detect`.
+      const portOwner = await gateway.probePrimaryPortOwner();
+      if (portOwner !== "kirocrew" && portOwner !== "service") {
+        log(`${channel} rejected: primary port held by ${portOwner}, not this shell's gateway`);
+        throw new Error(`${channel} is restricted to the local dashboard`);
+      }
+    };
+
+    ipcMain.handle("crash-reports:get", async (event) => {
+      await assertLocalDashboard(event, "crash-reports:get");
+      // Absent injection means the shell was assembled without a collector —
+      // report "nothing to see" rather than failing the renderer's first call.
+      return crashNoticeSummary(typeof crashScan === "function" ? crashScan() : null);
+    });
+
+    // Reveal, never read. The renderer names no path and receives no path: this
+    // resolves the log location in the trusted process from the scan it already
+    // performed, so the channel cannot be turned into "open an arbitrary file
+    // for me". Reveals the FILE (selected in its folder) rather than opening
+    // it, because the useful gesture is "hand this directory over" — the log
+    // sits beside chromium.log and the retained previous generation.
+    ipcMain.handle("crash-reports:reveal", async (event) => {
+      await assertLocalDashboard(event, "crash-reports:reveal");
+      const scan = typeof crashScan === "function" ? crashScan() : null;
+      if (!scan || !scan.crashLogPath) return { ok: false, error: "no crash log" };
+      try {
+        shell.showItemInFolder(scan.crashLogPath);
+        return { ok: true };
+      } catch (e) {
+        log(`crash-reports:reveal failed: ${e && e.message}`);
+        return { ok: false, error: String((e && e.message) || e) };
+      }
+    });
 
     // WSL2 host-runtime readout, rendered read-only by the Host runtime card.
     // Sender-restricted ON PURPOSE: the discovery result is a fact about THIS

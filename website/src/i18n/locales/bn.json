@@ -4992,6 +4992,12 @@
     "viewPr": "পুল রিকোয়েস্ট"
   },
   "components": {
+    "crashNotice": {
+      "diagnostics_were_saved_locally": "এই ডিভাইসে {{n}}টি নতুন ক্র্যাশ রেকর্ড সংরক্ষণ করা হয়েছে। সমস্যাটি রিপোর্ট করার সময় সেগুলি সংযুক্ত করুন।",
+      "dismiss": "বাতিল করুন",
+      "show_diagnostics": "ডায়াগনস্টিকস দেখান",
+      "the_app_closed_unexpectedly": "অ্যাপটি অপ্রত্যাশিতভাবে বন্ধ হয়ে গেছে"
+    },
     "crewWakeSection": {
       "active": "সক্রিয়",
       "cancel_new_schedule": "নতুন শিডিউল বাতিল করুন",
