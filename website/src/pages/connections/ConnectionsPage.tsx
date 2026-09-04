@@ -15,11 +15,13 @@ import {
   Unplug,
   X,
 } from 'lucide-react'
-import { api, type ConnectionMintState, type ConnectionStatus } from '../../api/client'
+import { api, ApiError, type ConnectionMintState, type ConnectionStatus } from '../../api/client'
 import { useAppSelector } from '../../store'
 import type { ChatMessage, McpApplyChange, McpServer } from '../../types'
 import { fmtDate } from '../../i18n/format'
 import { Badge, Btn, ContentSkeleton, SearchInput } from '../../components/ui'
+import ErrorNotice from '../../components/ErrorNotice'
+import { findReport, type ErrorReport } from '../../utils/errorReport'
 import McpTab from '../overview/McpTab'
 import ProviderLogo, { PROVIDER_LOGO_SLUGS } from './ProviderLogo'
 import {
@@ -55,6 +57,24 @@ export type Feedback = {
   /** Localized supplemental guidance appended after `text` (e.g. a provider's
    *  prerequisite steps on a zero-tools verdict). */
   detail?: string
+  /**
+   * Set when this feedback is the outcome of a FAILED request, which the shared
+   * error surface owns rather than this page's plain feedback line: the slot
+   * renders it through `ErrorNotice`, which recovers the structured context
+   * (endpoint, HTTP status, backend `code`) for the failure.
+   *
+   * A WRAPPER rather than a bare `report`, because the routing must not depend
+   * on the journal holding an entry: a lookup miss would silently fall back to
+   * the hand-written line this indirection exists to avoid. `report` is
+   * enrichment when the journal has it, and `ErrorNotice` degrades to its own
+   * message-keyed lookup when it does not.
+   *
+   * The report is carried explicitly rather than derived from `text`, because
+   * `text` here is a LOCALIZED string while the journal is keyed on the message
+   * the API layer produced -- so a lookup by the rendered text would miss in
+   * every locale, English included.
+   */
+  failure?: { report?: ErrorReport }
   revoke?: { href: string; provider: string }
   help?: { href: string }
 }
@@ -368,6 +388,12 @@ interface ConnectionCardProps {
    *  can name itself, while an unknowable one must keep the honest hedge. */
   grantPresent?: boolean
   busy?: ConnectionAction
+  /** The provider NAME (not slug) of whichever card currently owns the single
+   *  in-flight Connections Test, or undefined when none is running. Used only
+   *  to disable and explain every OTHER card's Test button -- this card's own
+   *  busy==='test' already covers its own button, and a card testing itself
+   *  must not disable against its own name. */
+  testingProvider?: string
   feedbackSlots: ReadonlyArray<{ slug: string; value: Feedback }>
   highlighted: boolean
   onConnect: () => Promise<unknown>
@@ -527,6 +553,7 @@ function ConnectionCard({
   connectedSince,
   grantPresent,
   busy,
+  testingProvider,
   feedbackSlots,
   highlighted,
   onConnect,
@@ -926,7 +953,12 @@ function ConnectionCard({
               </dl>
             )}
             <div className="flex justify-end gap-2">
-              <Btn onClick={() => void onTest()} disabled={!!busy}>
+              <Btn
+                onClick={() => void onTest()}
+                disabled={!!busy || !!testingProvider}
+                title={testingProvider ? t('pages.connectionsPage.test_blocked_by_sibling', { provider: testingProvider }) : undefined}
+                aria-label={testingProvider ? t('pages.connectionsPage.test_blocked_by_sibling', { provider: testingProvider }) : undefined}
+              >
                 {busy === 'test' ? <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" /> : <RotateCw className="w-3.5 h-3.5" aria-hidden="true" />}
                 {busy === 'test' ? t('pages.connectionsPage.testing') : t('pages.connectionsPage.test_connection')}
               </Btn>
@@ -980,7 +1012,10 @@ function ConnectionCard({
             return (
               <div
                 key={slot.slug}
-                role={slot.value.kind === 'success' ? 'status' : 'alert'}
+                // `ErrorNotice` renders its OWN role="alert", so the wrapper must
+                // not add a second one: nested alerts announce twice and make a
+                // by-role lookup ambiguous.
+                role={slot.value.failure ? undefined : (slot.value.kind === 'success' ? 'status' : 'alert')}
                 className={`col-start-1 row-start-1 ${
                   slot.value.kind === 'error'
                     ? 'text-danger'
@@ -989,7 +1024,15 @@ function ConnectionCard({
                       : 'text-ok'
                 }`}
               >
-                {slot.value.text}
+                {slot.value.failure ? (
+                  /* No hand-off: this gallery holds the return-address paste-back
+                     field, whose typed value lives only in card-local state until
+                     it is submitted, and the hand-off navigates to the chat and
+                     unmounts the tree -- discarding it. The refusal is also
+                     self-describing and self-correcting (wait for the running
+                     test, click again), so there is no diagnosis to hand over. */
+                  <ErrorNotice variant="inline" message={slot.value.text} report={slot.value.failure.report} />
+                ) : slot.value.text}
                 {slot.value.detail && (
                   <>
                     {' '}
@@ -1478,7 +1521,41 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
   }
 
   const testConnection = async (provider: ConnectionProvider) => run(provider, 'test', async () => {
-    const result = await api.connectionsTest(provider.slug)
+    let result
+    try {
+      result = await api.connectionsTest(provider.slug)
+    } catch (error) {
+      // A single-flight refusal is a REJECTED REQUEST, so it belongs to the
+      // shared error surface (`ErrorNotice`, via `Feedback.report`) rather than
+      // this page's plain feedback line -- but it is named rather than left to
+      // the ambiguous "action_failed" catch in `run` below, because the one
+      // thing the user needs is WHICH provider is holding the slot.
+      if (error instanceof ApiError && error.status === 409) {
+        let runningSlug = ''
+        try {
+          const parsed: unknown = JSON.parse(error.body)
+          if (parsed && typeof parsed === 'object' && typeof (parsed as { slug?: unknown }).slug === 'string') {
+            runningSlug = (parsed as { slug: string }).slug
+          }
+        } catch { /* malformed body — fall back to the generic provider name below */ }
+        const runningProvider = CONNECTION_PROVIDERS.find(candidate => candidate.slug === runningSlug)?.name
+          ?? provider.name
+        setFeedback(current => ({
+          ...current,
+          [provider.slug]: {
+            kind: 'error',
+            text: t('pages.connectionsPage.test_in_flight', { provider: runningProvider }),
+            // Keyed on the message the API layer journaled, not the localized
+            // text rendered above, so the endpoint/status/`code` context is
+            // recovered in every locale. A miss is tolerated -- the wrapper
+            // still routes through the shared error surface.
+            failure: { report: findReport(error.message) },
+          },
+        }))
+        return
+      }
+      throw error
+    }
     if (result.verdict === 'usable') {
       setFeedback(current => ({
         ...current,
@@ -1608,6 +1685,13 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
                   status?.status === 'awaiting_consent',
                 )
                 const cardBusy = busy?.slug === provider.slug ? busy.action : undefined
+                // Named only when a DIFFERENT card owns the running test: this
+                // card's own in-flight test is already covered by `cardBusy`,
+                // and naming a card against itself would read as nonsense
+                // ("Vercel is testing" on Vercel's own disabled button).
+                const testingProvider = busy?.action === 'test' && busy.slug !== provider.slug
+                  ? CONNECTION_PROVIDERS.find(candidate => candidate.slug === busy.slug)?.name
+                  : undefined
                 return (
                   <ConnectionCard
                     key={provider.slug}
@@ -1620,6 +1704,7 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
                     // indeterminate stays undefined so the card keeps the hedge.
                     grantPresent={confirmedGrantPresent(status)}
                     busy={cardBusy}
+                    testingProvider={testingProvider}
                     feedbackSlots={feedbackSlots}
                     highlighted={highlightedSlug === provider.slug}
                     onConnect={() => connect(provider)}
