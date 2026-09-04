@@ -519,6 +519,7 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
         schedule_check_refresh,
         schedule_visibility_refresh,
     )
+    from kiro_crew.platform.context import governance_generation
 
     owner_request = is_owner_dashboard_request(request)
     ws = web.WebSocketResponse(heartbeat=30)
@@ -589,6 +590,12 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
 
     # Push current slots immediately so sidebar populates without waiting.
     # App tokens get only the slots their manifest scope allows.
+    # Read the ceiling generation ONCE here and seed both the initial frame and
+    # the refresh loop's baseline from it. Two independent reads would leave a
+    # gap: a ceiling swapped between them is already the loop's baseline, so the
+    # loop never pushes, while the client still holds the number the frame sent —
+    # the change would be missed until an unrelated slot mutation.
+    initial_ceiling_generation = governance_generation()
     try:
         is_dashboard_user = ws.get("_is_dashboard_user", False)
         all_slots = state.serialize_slots(
@@ -645,6 +652,7 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                 # Seed the client's generation baseline so a later change is
                 # detectable as a change rather than as a first sighting.
                 "gitlabHostsGeneration": gitlab_hosts_generation(),
+                "governanceGeneration": initial_ceiling_generation,
             }
         )
         if owner_request or is_dashboard_user:
@@ -736,6 +744,10 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
         # the admitted window within ceil(len/cap) rounds.
         refresh_round = 0
         hosts_generation = gitlab_hosts_generation()
+        # Seeded from the value the initial frame carried, not a fresh read: the
+        # client's baseline IS that value, so a swap since then must register
+        # here as a change or the two sides disagree with no push to reconcile.
+        ceiling_generation = initial_ceiling_generation
         while not ws.closed and not shutdown_event.is_set():
             # Guard the body (not the whole loop) so a single transient failure
             # from source_link_urls()/schedule_check_refresh logs and continues
@@ -751,6 +763,13 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                 await ensure_gitlab_hosts_loaded()
                 if gitlab_hosts_generation() != hosts_generation:
                     hosts_generation = gitlab_hosts_generation()
+                    state.push_slots_update()
+                # Same shape for the governance ceiling: a centrally pushed policy
+                # swaps it between slot mutations, and the dashboard-config fields
+                # derived from it (``social_share_enabled``) would otherwise wait
+                # for an unrelated message to carry the new generation.
+                if governance_generation() != ceiling_generation:
+                    ceiling_generation = governance_generation()
                     state.push_slots_update()
                 urls = state.source_link_urls()
                 if urls:
