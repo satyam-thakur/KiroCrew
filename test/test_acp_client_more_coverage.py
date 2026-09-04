@@ -1676,13 +1676,17 @@ class TestAdvertisedModelCacheWiring:
         client._write_claude_local_settings()
         assert self._read_seed(tmp_path)["availableModels"] == served
 
-    def test_seed_falls_back_to_registry_on_cold_cache(self, tmp_path, monkeypatch):
+    def test_cold_cache_seeds_no_model_keys_at_all(self, tmp_path, monkeypatch):
+        # No static-registry fallback: a guessed allowlist poisons the adapter's
+        # union+dedup merge for any model the registry has not caught up on, so an
+        # unseeded file (adapter falls back to its own provider list) beats a stale
+        # one. The post-capture re-seed fills both keys in.
         monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})
-        client = _client(tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        client = _client(tmp_path, acp_backend=ACP_BACKEND_CLAUDE, model="claude-opus-5")
         client._write_claude_local_settings()
-        assert self._read_seed(tmp_path)["availableModels"] == mr.seed_available_models(
-            "claude_code"
-        )
+        seed = self._read_seed(tmp_path)
+        assert "availableModels" not in seed
+        assert "model" not in seed
 
     def test_claude_capture_feeds_and_flags_the_cache(self, tmp_path, monkeypatch):
         monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})
