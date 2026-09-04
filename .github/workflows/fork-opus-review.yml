@@ -464,14 +464,104 @@ jobs:
             else
               echo "_No completed Opus verdict for this commit; see the Fork Opus 4.8 Review job logs._"
             fi
-          } > /tmp/fork-opus-comment.md
-          existing="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
-            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$MARKER\"))) | .id" 2>/dev/null | head -n1 || true)"
-          if [ -n "$existing" ] && [ "$existing" != "null" ]; then
-            gh api --method PATCH "repos/$REPO/issues/comments/$existing" --field body="$(cat /tmp/fork-opus-comment.md)" >/dev/null || true
-          else
-            gh pr comment "$PR" --body-file /tmp/fork-opus-comment.md || true
-          fi
+          } > "${RUNNER_TEMP:-/tmp}/fork-opus-comment.md"
+          # Guarded upsert (#8292, #8344): the shared function below is defined
+          # byte-identically in every review lane; test_ai_review_workflows.py
+          # pins all copies to one canonical body so the invariant cannot
+          # drift lane by lane.
+          guarded_comment_upsert() {
+            local marker="$1" stamp="$2" slug="$3" lane="$4" out_file="$5"
+            local nb="<!-- ${slug}-stale-notice-begin -->"
+            local ne="<!-- ${slug}-stale-notice-end -->"
+            local ex_file="${RUNNER_TEMP:-/tmp}/${slug}-existing-comment.md"
+            local mg_file="${RUNNER_TEMP:-/tmp}/${slug}-merged-comment.md"
+            local matches existing_json existing
+            # Find the bot's existing marker comment (first match wins) and
+            # capture its CURRENT body in the SAME per-page --jq query that
+            # finds its id — {id, body} | @json, one compact line per match.
+            # Author filter: only a github-actions[bot] comment can match, so
+            # a PR commenter cannot plant the marker and have this step PATCH
+            # their comment with the write-scoped token. Capture the full
+            # paginated output FIRST and select off the captured value: a
+            # `... | head -n1` inside the pipeline lets head's early exit
+            # SIGPIPE the api call and misread a successful lookup as a
+            # failure under pipefail.
+            matches="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+              --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | {id, body} | @json" 2>/dev/null)" \
+              || matches=""
+            existing_json="$(printf '%s\n' "$matches" | awk 'NR == 1')"
+            existing="$(printf '%s\n' "$existing_json" | jq -r '.id // empty' 2>/dev/null)" || existing=""
+            # GitHub stores comment bodies with CRLF line endings; normalize
+            # to LF so the stamp grep and the line-anchored strip below see
+            # the same bytes this function originally wrote.
+            printf '%s\n' "$existing_json" | jq -r '.body // empty' 2>/dev/null | tr -d '\r' \
+              > "$ex_file" || : > "$ex_file"
+            if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+              if ! grep -Fq "$stamp $HEAD" "$out_file" && grep -Fq "$stamp" "$ex_file"; then
+                # Visibility invariant (#8292): a verdict that exists never
+                # becomes invisible. The REST comments API exposes no edit
+                # history, so an incomplete body (no current-head proof
+                # marker) PATCHed over a completed verdict would bury that
+                # verdict — including blocking findings — where no reader or
+                # tool looks. Keep the existing verdict and prepend ONE dated
+                # notice, replacing any notice a previous incomplete run left
+                # so they never stack. Only this transition is guarded:
+                # verdict bodies carry "<stamp> <head>" by construction, and
+                # the skip/override/no-contract upserts (current-head truths,
+                # not review failures) deliberately keep their own
+                # unconditional PATCH and never route through this function.
+                {
+                  printf '%s\n' "$marker"
+                  printf '%s\n' "$nb"
+                  printf '%s\n' "> ⚠️ **Stale verdict notice ($(date -u +'%Y-%m-%d %H:%M UTC')):** a later $lane run did not produce a completed verdict for \`$HEAD\`; the verdict below is from an earlier completed run. See the $lane job logs and re-run the workflow."
+                  printf '%s\n' "$ne"
+                  printf '%s\n' ""
+                  # Strip the leading marker line and any previous notice.
+                  # The notice this function writes always sits at a
+                  # deterministic position — line 1 is the lane marker,
+                  # line 2 the begin marker, line 3 the notice text, line 4
+                  # the end marker — so a previous notice is recognized ONLY
+                  # when the begin marker is the exact whole line 2 AND its
+                  # end marker closes within the head window (lines 2-8).
+                  # Everything else is preserved verbatim: the preserved body
+                  # embeds model-authored review prose that can QUOTE these
+                  # markers anywhere, and stripping on a quoted marker — or
+                  # past a missing end marker — would delete verdict content,
+                  # the very failure this guard exists to prevent. An
+                  # unterminated block is restored from the buffer (worst
+                  # case: a stacked notice, cosmetic and recoverable).
+                  awk -v m="$marker" -v nb="$nb" -v ne="$ne" '
+                    NR == 1 && $0 == m { next }
+                    NR == 2 && $0 == nb { buf = $0; buffering = 1; next }
+                    buffering {
+                      buf = buf "\n" $0
+                      if ($0 == ne) { buffering = 0; buf = ""; next }
+                      if (NR >= 8) { print buf; buffering = 0; buf = ""; next }
+                      next
+                    }
+                    { print }
+                    END { if (buffering) print buf }
+                  ' "$ex_file"
+                } > "$mg_file"
+                gh api --method PATCH "repos/$REPO/issues/comments/$existing" \
+                  --field body="$(cat "$mg_file")" >/dev/null || true
+                echo "Preserved posted $lane verdict in comment #$existing; prepended stale-verdict notice for $HEAD"
+              else
+                gh api --method PATCH "repos/$REPO/issues/comments/$existing" \
+                  --field body="$(cat "$out_file")" >/dev/null || true
+                echo "Updated existing $lane comment #$existing"
+              fi
+            else
+              # No existing comment — or the lookup itself failed — falls
+              # through to CREATE either way. A completed verdict must never
+              # be silently dropped because a lookup failed (a duplicate
+              # comment is recoverable; an unposted verdict is not), and an
+              # incomplete body posted as a NEW comment cannot bury anything.
+              gh pr comment "$PR" --body-file "$out_file" || true
+              echo "Created new $lane comment"
+            fi
+          }
+          guarded_comment_upsert "$MARKER" "[OPUS-REVIEWED]" "claude" "Fork Opus 4.8 Review" "${RUNNER_TEMP:-/tmp}/fork-opus-comment.md"
 
       # Fail-CLOSED finalize of the required "Opus 4.8 Review" check-run, keyed to
       # head_sha; posts a failing check-run if the job died before opening one.

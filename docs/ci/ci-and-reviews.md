@@ -505,16 +505,20 @@ no-output review must not look clean. A BLOCKING-labelled finding without the
 `[BLOCK-MERGE]` marker is only a non-gating **advisory warning**, since a coherence
 check on that pairing mis-fires whenever the model quotes prior text.
 
-The GPT summary comment is upserted in place, which once let a failed run's
-"review incomplete" body replace a posted verdict — the REST comments API
-exposes no edit history, so a `[BLOCK-MERGE]` finding vanished from every
-surface a reader or tool checks (#8292). The same-repo GPT lane's post step
-now refuses exactly that transition: an incomplete body never overwrites a
-marker-present verdict; it keeps the existing verdict and prepends one dated
-stale-verdict notice instead. Completed verdicts and human overrides still
-replace the comment, and the fail-closed gate above is unchanged. The fork
-GPT lane (`fork-gpt-review.yml`) still PATCHes unconditionally and is tracked
-separately.
+The review summary comments are upserted in place, which once let a failed
+run's "review incomplete" body replace a posted verdict — the REST comments
+API exposes no edit history, so a `[BLOCK-MERGE]` finding vanished from every
+surface a reader or tool checks (#8292). Every lane's post step now refuses
+exactly that transition: a body carrying no current-head verdict stamp never
+overwrites a body bearing that lane's verdict stamp; it keeps the existing
+verdict and prepends one dated stale-verdict notice instead (#8344).
+Completed verdicts, human overrides, and skip notices — current-head
+determinations, not review failures — still replace the comment, and the
+fail-closed gates are unchanged. The same-repo GPT lane carries the guard
+inline in `codex-review.yml`; the other eight upsert sites define it as a
+`guarded_comment_upsert` bash function that `test_ai_review_workflows.py`
+pins byte-identical across every lane, so the invariant cannot drift lane by
+lane.
 
 ### Security posture of the reviewer jobs
 
