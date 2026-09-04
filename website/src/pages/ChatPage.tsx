@@ -72,7 +72,7 @@ import { deriveLoadedMcpTools } from '../lib/mcpLoadedTools'
 import type { McpServer } from '../types'
 import { useScrollManager } from './chat/useScrollManager'
 import { useBubbleVanishProbe } from './chat/useBubbleVanishProbe'
-import { shouldPaginateOlder, shouldContinueOlderWalk, canForkAtWindow, searchScopeIsLimited, earlierAffordanceInView, EARLIER_BAR_SELECTOR } from './chat/pagination'
+import { shouldPaginateOlder, shouldContinueOlderWalk, canForkAtWindow, searchScopeIsLimited, earlierAffordanceInView, EARLIER_BAR_SELECTOR, OLDER_WALK_MAX_PAGES_PER_INPUT } from './chat/pagination'
 import EarlierMessagesBar from './chat/EarlierMessagesBar'
 import TranscriptScrollShell from './chat/TranscriptScrollShell'
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
@@ -125,22 +125,16 @@ export function shouldAutoFillOlder(g: { scrollHeight: number; clientHeight: num
   if (g.scrollHeight <= g.clientHeight + OLDER_FILL_SLACK_PX) return true
   return g.sawInput
 }
-const IDLE_PREFETCH_QUIET_MS = 6000
-const IDLE_PREFETCH_TICK_MS = 1000
-/** How long one real gesture authorizes the idle prefetch.
- *
- *  MUST exceed IDLE_PREFETCH_QUIET_MS: the prefetch only fires after that much
- *  quiet, so an authorization window shorter than the quiet window can never be
- *  open when the tick arrives and the prefetch would be dead code.
+/** How long one real gesture authorizes an automatic older-history fetch.
  *
  *  It is a WINDOW and not a latch because the latch was the defect. A landing's
- *  own compensation writes scrollTop, which fires a `scroll` event, which the
- *  quiet timer accepts as activity -- so with permanent authorization the loop
- *  ran land -> quiet -> land at a steady beat over a reader who was not asking
- *  for any of it. Only `wheel` and `touchmove` refresh this stamp, and our own
- *  writes produce neither, so the window ages out on its own: a gesture burst
- *  buys a couple of pages, not the rest of the session. */
-const IDLE_PREFETCH_AUTH_MS = 20000
+ *  own compensation writes scrollTop, which fires a `scroll` event, so with
+ *  permanent authorization the automatic doors ran land -> quiet -> land at a
+ *  steady beat over a reader who was not asking for any of it. Only `wheel` and
+ *  `touchmove` refresh this stamp, and our own writes produce neither, so the
+ *  window ages out on its own: a gesture burst buys a bounded run of pages, not
+ *  the rest of the session. */
+const REAL_GESTURE_AUTH_MS = 20000
 
 /**
  * Height of the transcript's tail spacer, in px.
@@ -1704,6 +1698,26 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // Timestamp of the last REAL gesture (wheel/touchmove). Separate from the
   // latch above because the idle prefetch's authorization must expire.
   const lastRealInputAtRef = useRef(0)
+  // Pages the SENTINEL door has issued since the last real gesture. The walk
+  // poll bounds itself the same way (OLDER_WALK_MAX_PAGES_PER_INPUT) because an
+  // unbounded authorization once walked a whole multi-megabyte transcript over a
+  // parked reader; this door needs its own counter because the poll's lives
+  // inside its interval effect, out of reach here.
+  const sentinelPagesSinceInputRef = useRef(0)
+  // Entering a session is not a request for history, so a session must never
+  // INHERIT authorization. Every one of these is written in exactly one place --
+  // `noteInput`, on a real wheel/touchmove over the transcript -- and that
+  // listener's effect is not keyed on the slot, so without this clear a gesture
+  // in the session you just left still authorizes the automatic doors in the one
+  // you just opened. `sawRealInputRef` is worse: a one-way latch, so a single
+  // touch would authorize the walk poll for every session for the rest of the
+  // mount, which is the opposite of what its own comment promises ("this
+  // session"). Reader intent belongs to the session it happened in.
+  useEffect(() => {
+    sawRealInputRef.current = false
+    lastRealInputAtRef.current = 0
+    sentinelPagesSinceInputRef.current = 0
+  }, [activeSlot])
   const vScrollToBottomRef = useRef<(behavior?: ScrollBehavior) => void>(() => {})
   // Mirrored so the early handlers (declared above `virt`) can refuse to page on
   // unsettled geometry, the same gate the walk poll and idle prefetch apply.
@@ -6587,6 +6601,19 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   }, [])
 
   // Reaching the top of a resumed transcript fetches the history behind the loaded slice.
+  /**
+   * Has the active session finished ARRIVING? Every automatic history fetch is
+   * shut until it has.
+   *
+   * This gates the door itself rather than feeding shouldAutoFillOlder, because
+   * an empty transcript satisfies that predicate's "too short to scroll" branch
+   * on GEOMETRY alone -- the one path no gesture requirement can close, since
+   * the branch returns before it ever reads `sawInput`. A switch installs an
+   * empty list, restores cursor ownership on fulfilment, and leaves the earlier
+   * bar sitting in view with nothing above it: three conditions that together
+   * read as "the reader is at the top asking for history" while the reader has
+   * done nothing at all.
+   */
   const handleTopReached = useCallback(() => {
     const chat = store.getState().chat
     if (!shouldPaginateOlder({ loadingOlder: chat.loadingOlder, slotHasMore: chat.slotHasMore })) return
@@ -6610,18 +6637,43 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // a phone as history loading while TYPING. Both the walk poll and the idle
     // prefetch already refuse to page on unsettled geometry; this door did not,
     // and it is the one the sentinel comes through.
+    // An empty transcript is NOT "too short to scroll" -- it is "not loaded yet".
+    // shouldAutoFillOlder cannot tell the two apart: both satisfy its geometry
+    // branch, which returns before it ever reads `sawInput`, so no authorization
+    // requirement can close that path. Separating the two states is what stops a
+    // session ENTRY from reading as a reader parked at the top asking for history.
+    // The measured-rows loop below cannot do it either: over zero rows it checks
+    // nothing and falls straight through.
+    if (displayItemsRef.current.length === 0) return
     const nRows = displayItemsRef.current.length
     for (let i = 0; i < nRows; i++) { if (!vFarmIsMeasuredRef.current?.(i)) return }
-    // `sawRealInputRef` is a one-way latch, so on a scrollable transcript it is
-    // open for the rest of the session after a single touch — which is not what
-    // this site's own comment promises ("further history is reader-initiated").
-    // The state it actually means is "the reader is not sitting at the live end":
-    // a climb releases follow, and the sentinel then serves them.
+    // Neither of the two obvious signals can key this. `sawRealInputRef` is a
+    // one-way latch, so on a scrollable transcript one touch leaves it open for
+    // the rest of the mount — it cannot mean "this session". And `!follow` is the
+    // design shouldAutoFillOlder's own contract names as falsified: follow is
+    // released with no reader input at all, both by an anchor restore and at slot
+    // entry, where `lastWriteTop` resets to -1 so the idle branch's self-check
+    // cannot rescue it. Either one turns an entry geometry transient into a fetch
+    // nobody asked for.
+    // What survives both is the EXPIRING form of the real-gesture record, which
+    // the automatic doors already apply: a timestamp cannot latch open, and it is
+    // silent on a slot the reader has not touched.
     if (el && !shouldAutoFillOlder({
       scrollHeight: el.scrollHeight,
       clientHeight: el.clientHeight,
-      sawInput: !vGetFollowRef.current(),
+      sawInput: Date.now() - lastRealInputAtRef.current <= REAL_GESTURE_AUTH_MS,
     })) return
+    // A gesture authorizes a BOUNDED run of pages, not the whole authorization
+    // window. Authorization alone is what let one flick chain prepends until the
+    // transcript ran out and left the reader at the very start of history.
+    // The short-transcript fill is exempt because it bounds itself: every page
+    // makes the transcript taller, so the geometry branch stops admitting once it
+    // outgrows the viewport, and bounding it would strand a transcript that is
+    // still too short to offer a scrollbar.
+    if (el && el.scrollHeight > el.clientHeight + OLDER_FILL_SLACK_PX) {
+      if (sentinelPagesSinceInputRef.current >= OLDER_WALK_MAX_PAGES_PER_INPUT) return
+      sentinelPagesSinceInputRef.current += 1
+    }
     void dispatch(loadOlderMessages())
   }, [dispatch, earlierBarInView])
   /**
@@ -6761,6 +6813,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       walkPagesSinceInput = 0
       sawRealInputRef.current = true
       lastRealInputAtRef.current = Date.now()
+      sentinelPagesSinceInputRef.current = 0
     }
     el?.addEventListener('wheel', noteInput, { passive: true })
     el?.addEventListener('touchmove', noteInput, { passive: true })
@@ -6833,83 +6886,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps -- listeners re-arm on these triggers only; handlers read refs
   }, [slotHasMore, dispatch, virt.scrollerRef])
-
-  // ---- Idle history prefetch (feeds the measure farm) ----
-  // The bounded initial fetch means most of a long transcript is not loaded,
-  // so the farm has nothing to measure and the reader's first back-scroll
-  // still crosses estimate territory. While the user is IDLE and everything
-  // currently loaded is measured, pull the next older page; the farm then
-  // measures it, and the cycle repeats until the whole session is measured
-  // geometry (persisted per device+width). Ordering matters: pages land only
-  // when the farm is caught up, so the unmeasured frontier never outruns the
-  // sweep, and any landing happens while nobody is watching.
-  useEffect(() => {
-    if (!slotHasMore || !activeSlot) return
-    const el = virt.scrollerRef?.current
-    let lastActivity = Date.now()
-    // The quiet gate is checked at DISPATCH, but the fetch lands 1-2s later —
-    // possibly mid-gesture on a phone, where a landing's scrollTop
-    // compensation fights the momentum curve (iOS overrides programmatic
-    // writes during a fling) and a stray frame inside the bottom band can
-    // re-arm follow. Aborting the in-flight prefetch the moment ANY activity
-    // resumes guarantees a page never lands under the reader: the thunk
-    // rejects as aborted, the reducer merges nothing and sets no error flag.
-    let inFlight: { abort: () => void } | null = null
-    const noteActivity = () => {
-      lastActivity = Date.now()
-      if (inFlight) { inFlight.abort(); inFlight = null }
-    }
-    el?.addEventListener('scroll', noteActivity, { passive: true })
-    el?.addEventListener('wheel', noteActivity, { passive: true })
-    el?.addEventListener('touchmove', noteActivity, { passive: true })
-    const t = setInterval(() => {
-      if (Date.now() - lastActivity < IDLE_PREFETCH_QUIET_MS) return
-      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
-      // Reader-initiated only -- the same authorization the sentinel and the
-      // walk poll require (shouldAutoFillOlder). This prefetch was the third
-      // self-issue door: its quiet signal listens to scroll events, but a
-      // landing's own compensation writes scrollTop, so on a slow phone the
-      // loop ran land -> quiet window -> next page at a steady beat (the
-      // replica probe measured one ?before= page every ~8s with zero input
-      // events, felt as 'something keeps slowly loading, then bounces').
-      // A transcript too short to scroll still fills; input unlocks the rest.
-      // A bottom-followed reader is at the LIVE end: a page of history has
-      // nothing for them and its landing is pure disturbance budget. The walk
-      // poll already refuses them for exactly this reason; the prefetch did not,
-      // which is how a reader parked at the bottom got moved by it.
-      if (vGetFollowRef.current()) return
-      if (!earlierBarInViewRef.current()) return
-      const scrEl = vScrollerElRef.current
-      // Authorization EXPIRES (see IDLE_PREFETCH_AUTH_MS). `sawRealInputRef` is a
-      // one-way latch, so passing it here meant one touch of the transcript --
-      // which reading a long chat requires -- unlocked the prefetch for the rest
-      // of the mount.
-      const recentInput = Date.now() - lastRealInputAtRef.current <= IDLE_PREFETCH_AUTH_MS
-      if (scrEl && !shouldAutoFillOlder({ scrollHeight: scrEl.scrollHeight, clientHeight: scrEl.clientHeight, sawInput: recentInput })) return
-      const chat = store.getState().chat
-      if (!chat.slotHasMore || chat.loadingOlder || chat.slotOlderError) return
-      if (chat.slotCursorKey !== chat.activeSlot) return
-      // Never during a live turn: streaming appends re-group the list.
-      if ((chat.slotRun?.[chat.activeSlot ?? '']?.state ?? 'idle') !== 'idle') return
-      // Only once the farm is caught up: every loaded row measured.
-      const n = displayItemsRef.current.length
-      for (let i = 0; i < n; i++) { if (!virt.farmIsMeasured(i)) return }
-      const req = dispatch(loadOlderMessages())
-      inFlight = req
-      void (req as unknown as Promise<unknown>).finally?.(() => { if (inFlight === req) inFlight = null })
-    }, IDLE_PREFETCH_TICK_MS)
-    return () => {
-      clearInterval(t)
-      inFlight?.abort()
-      el?.removeEventListener('scroll', noteActivity)
-      el?.removeEventListener('wheel', noteActivity)
-      el?.removeEventListener('touchmove', noteActivity)
-    }
-    // virt's stable members only: the return object's identity changes every
-    // render, and depending on it re-arms the interval per render — which
-    // resets the quiet-time clock so the prefetch never fires at all.
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- interval must not re-arm per render (see comment above)
-  }, [slotHasMore, activeSlot, dispatch, virt.scrollerRef, virt.farmIsMeasured])
 
   // The sticky in-flight spinner is only meaningful where pages LAND — at the
   // top of the loaded transcript. `loadingOlder` is now true for the whole

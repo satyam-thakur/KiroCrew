@@ -1301,11 +1301,22 @@ export const SLOT_DETAIL_MAX_LIMIT = 500
  * The reason for going unbounded was real but narrower than the rule: a bounded
  * page is a WINDOW, and if the server grew past it the window could sit entirely
  * newer than the cache, leaving a hole in the middle of the transcript. That is
- * a question of COVERAGE, not of boundedness — so ask for the cache plus one
- * page, which covers everything held unless the server grew by more than a page
- * since (impossible while idle; a streaming slot still goes unbounded). The
- * caller verifies coverage against the response and re-fetches unbounded only
- * when the bound was actually hit.
+ * a question of COVERAGE, not of boundedness — and coverage is VERIFIED after the
+ * response (`slotSwitchNeedsUnboundedRetry` compares growth against the window
+ * that was asked for), so it does not have to be pre-purchased with a larger
+ * window.
+ *
+ * Which matters because the window extends BACKWARD from the newest row: every
+ * row of headroom is a row of OLDER history nobody asked for. Buying a page of
+ * margin therefore grew the transcript upward by a page on every revisit, and
+ * since the next revisit measures the cache it just grew, it ratcheted — one page
+ * per switch until the handler ceiling. Reported from a phone as history loading
+ * itself on every session switch, from a reader parked at the live end, with no
+ * gesture and no spinner (this path never sets `loadingOlder`, so it is invisible
+ * to every guard on the automatic older-history doors).
+ *
+ * So ask for exactly what this tab already holds — never fewer than one page —
+ * and let the coverage check pay for the rare case instead.
  */
 export function slotSwitchFetchLimit(input: {
   streaming: boolean
@@ -1317,7 +1328,7 @@ export function slotSwitchFetchLimit(input: {
   const maxLimit = input.maxLimit ?? SLOT_DETAIL_MAX_LIMIT
   if (input.streaming) return undefined
   if (input.cached <= 0) return pageLimit
-  return Math.min(maxLimit, input.cached + pageLimit)
+  return Math.min(maxLimit, Math.max(pageLimit, input.cached))
 }
 
 /**

@@ -9,9 +9,18 @@
  *
  * What the unbounded shape actually protected against is a HOLE: a window
  * sitting entirely newer than the cache leaves a gap mid-transcript. That is a
- * coverage question, so these pins fix the two halves separately — the bound
- * asks for the cache plus a page, and the retry fires on GROWTH large enough to
- * clear that window, not on the response's size.
+ * coverage question, so these pins fix the two halves separately — the bound asks
+ * for exactly what the tab already holds, and the retry fires on GROWTH large
+ * enough to clear that window, not on the response's size.
+ *
+ * The bound must not buy headroom. The window extends BACKWARD from the newest
+ * row, so every spare row is a row of OLDER history nobody asked for; asking for
+ * the cache plus a page grew the transcript upward on every revisit, and because
+ * the next revisit measures the cache it just grew, it ratcheted one page per
+ * switch to the handler ceiling. Reported from a phone as history loading itself
+ * on every session switch, from a reader parked at the live end — with no gesture
+ * and no spinner, since this path never sets `loadingOlder` and so is invisible
+ * to every guard on the automatic older-history doors.
  */
 import { describe, it, expect } from 'vitest'
 import {
@@ -33,8 +42,20 @@ describe('slotSwitchFetchLimit', () => {
     expect(slotSwitchFetchLimit({ streaming: true, cached: 4000 })).toBeUndefined()
   })
 
-  it('bounds a PAINTED idle slot to the cache plus a page, not the whole corpus', () => {
-    expect(slotSwitchFetchLimit({ streaming: false, cached: 120 })).toBe(120 + OLDER_PAGE_LIMIT)
+  it('bounds a PAINTED idle slot to exactly the cache, so a revisit loads no older history', () => {
+    // Not `cached + a page`: the window runs backward from the newest row, so a
+    // page of headroom IS a page of older history, fetched on every revisit and
+    // ratcheting upward because the next revisit measures the grown cache.
+    expect(slotSwitchFetchLimit({ streaming: false, cached: 120 })).toBe(120)
+    // A revisit of the grown cache asks for the grown cache -- and nothing more,
+    // so the transcript stops climbing instead of walking to the ceiling.
+    expect(slotSwitchFetchLimit({ streaming: false, cached: 220 })).toBe(220)
+  })
+
+  it('still asks for a whole page when the cache is smaller than one', () => {
+    // A handful of painted rows must not shrink the window below the page every
+    // other path uses, or the first switch would serve less than a fresh open.
+    expect(slotSwitchFetchLimit({ streaming: false, cached: 3 })).toBe(OLDER_PAGE_LIMIT)
   })
 
   it('never asks past the handler ceiling, which would be clamped silently', () => {

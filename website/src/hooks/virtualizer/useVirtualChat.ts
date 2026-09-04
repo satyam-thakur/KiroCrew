@@ -2513,9 +2513,23 @@ export function useVirtualChat<T>(
    *  the other viewport baselines are advanced by the scroll handler and the
    *  resize observer, which run on different schedules than this effect. */
   const topCrossingClientHRef = useRef(0)
+  /** Session this effect's baselines belong to. `windowRange.start` is only
+   *  comparable against a PREVIOUS value from the SAME transcript: on a session
+   *  switch the new transcript's window starts wherever its own bounded page
+   *  puts it, and comparing that against the outgoing session's residual value
+   *  manufactures a downward crossing with nobody having scrolled — which
+   *  admits an older-history fetch at the instant of entry. Re-baseline and
+   *  skip, exactly as the viewport-growth cause below does. */
+  const topCrossingSessionRef = useRef<string | null>(null)
   useEffect(() => {
     const prev = prevWindowStartRef.current
     prevWindowStartRef.current = windowRange.start
+    const prevSession = topCrossingSessionRef.current
+    topCrossingSessionRef.current = sessionId
+    if (prevSession !== sessionId) {
+      topCrossingClientHRef.current = scrollerRef.current?.clientHeight ?? 0
+      return
+    }
     if (itemCount === 0 || prev === null) return
     // A scroller with no laid-out height cannot have a reader travelling in
     // it: zero-layout environments (jsdom, a hidden pane) collapse the window
@@ -2538,7 +2552,7 @@ export function useVirtualChat<T>(
       onTopReachedRef.current?.()
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps -- trigger set is deliberate; the rest is read through refs
-  }, [windowRange.start, itemCount, prefetchStartIndex])
+  }, [windowRange.start, itemCount, prefetchStartIndex, sessionId])
 
   // ---- IntersectionObserver: top/bottom sentinels for window expansion ----
   useEffect(() => {

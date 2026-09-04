@@ -3,8 +3,8 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 /**
- * REGRESSION GUARD — the idle older-prefetch cannot feed itself, and cannot move
- * a reader who is parked at the live end.
+ * REGRESSION GUARD — an automatic older-history fetch is authorized by a REAL
+ * gesture, and that authorization ages out instead of latching.
  *
  * Reported from a phone as "还是有自动 load previous 的问题，然后导致弹跳" — a page
  * of history landing on its own every few seconds, each landing displacing the
@@ -13,61 +13,20 @@ import { join } from 'node:path'
  * sitting at `scrollTop === max` finds max has grown and is suddenly that far
  * from the bottom.
  *
- * Two independent defects made it self-sustaining:
+ * What made it self-sustaining: `sawRealInputRef` is a one-way latch with a
+ * single write and no reset, so one touch of the transcript — which reading a
+ * long chat requires — unlocked the automatic doors permanently. A landing's own
+ * compensation writes scrollTop, that write fires a `scroll` event, and a quiet
+ * timer counts it as activity: land → quiet → land, forever. The authorization
+ * is therefore a WINDOW refreshed only by `wheel`/`touchmove`, which our own
+ * writes never produce, so it ages out instead of latching.
  *
- * 1. NO POSITION GUARD. The walk poll refuses a bottom-followed reader in as many
- *    words ("its landings are pure disturbance budget"); the prefetch did not, so
- *    it was the one door left open to someone reading the live end.
- *
- * 2. AUTHORIZATION NEVER EXPIRED. `sawRealInputRef` is a one-way latch with a
- *    single write and no reset, so one touch of the transcript — which reading a
- *    long chat requires — unlocked the prefetch permanently. A landing's own
- *    compensation writes scrollTop, that write fires a `scroll` event, and the
- *    quiet timer counts it as activity: land → quiet → land, forever. The fix is
- *    a window refreshed only by `wheel`/`touchmove`, which our own writes never
- *    produce, so it ages out instead of latching.
- *
- * Source-scanned because the prefetch is an interval inside an effect with no
- * exported seam; the arithmetic relation in the third test is the part most
- * likely to be broken silently by a later constant tweak.
+ * Source-scanned because these gates live in interval bodies and callbacks with
+ * no exported seam.
  */
 const SRC = readFileSync(join(__dirname, '..', 'pages', 'ChatPage.tsx'), 'utf8')
 
-/** The idle-prefetch interval body. */
-function prefetchBody(): string {
-  const i = SRC.indexOf('IDLE_PREFETCH_QUIET_MS) return')
-  expect(i).toBeGreaterThan(-1)
-  const end = SRC.indexOf('}, IDLE_PREFETCH_TICK_MS)', i)
-  expect(end).toBeGreaterThan(i)
-  return SRC.slice(i, end)
-}
-
-function constValue(name: string): number {
-  const m = SRC.match(new RegExp(`const ${name} = (\\d+)`))
-  expect(m).not.toBeNull()
-  return Number(m![1])
-}
-
-describe('idle older-prefetch', () => {
-  it('refuses a bottom-followed reader, like the walk poll already does', () => {
-    expect(prefetchBody()).toMatch(/if \(vGetFollowRef\.current\(\)\) return/)
-  })
-
-  it('authorizes on a RECENT gesture, never on the one-way latch', () => {
-    const body = prefetchBody()
-    expect(body).toMatch(/IDLE_PREFETCH_AUTH_MS/)
-    expect(body).toMatch(/sawInput: recentInput/)
-    // The latch must not be what authorizes this path any more.
-    expect(body).not.toMatch(/sawInput: sawRealInputRef\.current/)
-  })
-
-  it('keeps the authorization window wider than the quiet window', () => {
-    // The prefetch fires only after IDLE_PREFETCH_QUIET_MS of silence, so an
-    // authorization window at or below that can never be open when the tick
-    // arrives — the prefetch would silently become dead code rather than fail.
-    expect(constValue('IDLE_PREFETCH_AUTH_MS')).toBeGreaterThan(constValue('IDLE_PREFETCH_QUIET_MS'))
-  })
-
+describe('real-gesture authorization', () => {
   it('refreshes the gesture stamp from gestures only, not from scroll', () => {
     // Our own compensation write fires `scroll`. If that refreshed the stamp the
     // window would be self-renewing and the latch would be back under a new name.
@@ -85,7 +44,10 @@ describe('top sentinel (handleTopReached)', () => {
   function sentinelBody(): string {
     const i = SRC.indexOf('const handleTopReached = useCallback(')
     expect(i).toBeGreaterThan(-1)
-    const end = SRC.indexOf('}, [dispatch])', i)
+    // The handler's own closing line, whatever its dependency list holds. Anchoring
+    // on one literal dep array silently over-slices the moment a dep is added, and
+    // then these assertions can pass on code from a LATER function.
+    const end = SRC.indexOf('\n  }, [', i)
     expect(end).toBeGreaterThan(i)
     return SRC.slice(i, end)
   }
@@ -95,18 +57,68 @@ describe('top sentinel (handleTopReached)', () => {
     // fires on a geometry TRANSIENT too — and the composer's text is ChatPage
     // state, so every keystroke re-renders this tree and offers the virtualizer
     // another chance to be caught mid-measurement. Reported from a phone as
-    // history loading while TYPING. The walk poll and the idle prefetch both
-    // require every row measured before paging; this door is the one the sentinel
-    // comes through and it had no such gate.
+    // history loading while TYPING. The walk poll requires every row measured
+    // before paging; this door is the one the sentinel comes through and it had
+    // no such gate.
     expect(sentinelBody()).toMatch(/vFarmIsMeasuredRef\.current\?\.\(i\)/)
   })
 
-  it('authorizes on reader POSITION, not on the one-way input latch', () => {
-    // The site's own comment promises "further history is reader-initiated" on a
-    // scrollable transcript. `sawRealInputRef` is a latch with one write and no
-    // reset, so it cannot express that; not being at the live end can.
+  it('separates "not loaded yet" from "too short to scroll"', () => {
+    // shouldAutoFillOlder's geometry branch returns before it ever reads
+    // `sawInput`, so no authorization requirement can close it — and an EMPTY
+    // transcript satisfies it just as a genuinely short one does. A switch
+    // installs an empty list, restores cursor ownership, and leaves the earlier
+    // bar in view with nothing above it, which together read as "reader parked at
+    // the top asking for history" while the reader has done nothing. Reported from
+    // a phone as load-previous on every session switch.
+    // The measured-rows loop cannot stand in for this: over zero rows it checks
+    // nothing and falls straight through.
     const body = sentinelBody()
-    expect(body).toMatch(/sawInput: !vGetFollowRef\.current\(\)/)
+    expect(body).toMatch(/if \(displayItemsRef\.current\.length === 0\) return/)
+    // Anchor on the CALL, not the bare name: this handler's comments discuss
+    // shouldAutoFillOlder by name, so a bare-name indexOf compares prose order.
+    expect(body.indexOf('length === 0')).toBeLessThan(body.indexOf('!shouldAutoFillOlder({'))
+  })
+
+  it('never inherits authorization from the session just left', () => {
+    // Each of these has exactly one write site (`noteInput`, on a real
+    // wheel/touchmove), and that listener's effect is not keyed on the slot — so
+    // without a per-slot clear, a gesture in the session you left authorizes the
+    // doors in the one you opened. `sawRealInputRef` is a one-way latch, so one
+    // touch would authorize the walk poll for every session for the whole mount.
+    const i = SRC.indexOf('useEffect(() => {\n    sawRealInputRef.current = false')
+    expect(i).toBeGreaterThan(-1)
+    const body = SRC.slice(i, SRC.indexOf('}, [', i) + 20)
+    expect(body).toMatch(/lastRealInputAtRef\.current = 0/)
+    expect(body).toMatch(/sentinelPagesSinceInputRef\.current = 0/)
+    // Keyed on the slot, so entering ANY session starts from no authorization.
+    expect(body).toMatch(/\}, \[activeSlot\]\)/)
+  })
+
+  it('authorizes on a RECENT gesture — not on the latch, and not on follow', () => {
+    const body = sentinelBody()
+    // Neither obvious signal can key this. `sawRealInputRef` is a latch with one
+    // write and no reset, so one touch of a scrollable transcript leaves it open
+    // for the rest of the mount.
     expect(body).not.toMatch(/sawInput: sawRealInputRef\.current/)
+    // And `!follow` is the design shouldAutoFillOlder's own contract names as
+    // falsified — follow is released with no reader input by an anchor restore and
+    // at slot entry, where `lastWriteTop` resets to -1 so the idle branch's
+    // self-check cannot rescue it. The replica probe measured one page per ~8s
+    // through that door with zero input events.
+    expect(body).not.toMatch(/sawInput: !vGetFollowRef\.current\(\)/)
+    expect(body).toMatch(/sawInput: Date\.now\(\) - lastRealInputAtRef\.current <= REAL_GESTURE_AUTH_MS/)
+  })
+
+  it('bounds the pages one gesture buys', () => {
+    // Authorization alone is not enough: the window is 20s and a landing does not
+    // close it, so an unbounded door let one flick chain prepends until history ran
+    // out and left the reader at the very start of the transcript. The walk poll
+    // bounds itself the same way; this door must too.
+    const body = sentinelBody()
+    expect(body).toMatch(/sentinelPagesSinceInputRef\.current >= OLDER_WALK_MAX_PAGES_PER_INPUT/)
+    // The short-transcript fill stays exempt — it bounds itself, since every page
+    // makes the transcript taller until the geometry branch stops admitting.
+    expect(body).toMatch(/el\.scrollHeight > el\.clientHeight \+ OLDER_FILL_SLACK_PX/)
   })
 })
