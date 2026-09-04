@@ -21,7 +21,7 @@
  */
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { ArrowLeft, Clock, ExternalLink, Pencil, UserPlus, Users, Webhook } from 'lucide-react'
+import { ArrowLeft, Circle, Clock, ExternalLink, Pencil, UserPlus, Users, Webhook } from 'lucide-react'
 import { PanelRightSolid } from '../../components/icons/panels'
 import { useTranslation } from 'react-i18next'
 import { api, type MemberActivityEntry, type MemberRosterRow, type WebhookTokenEntry } from '../../api/client'
@@ -67,6 +67,15 @@ const DRAWER_WIDTH_KEY = 'mc-members-drawer-width'
 const THREAD_MIN_RESERVE = CHAT_PANE_MIN_W + 24
 /** Punctuation, not prose: joins an activity label to its project name. */
 const PROJECT_SEPARATOR = ' \u00b7 '
+/** Driving-sessions rows shown before the list folds behind "Show all". */
+const DRIVING_VISIBLE = 5
+/** A slot's settled activity instant as epoch SECONDS (what timeAgo takes), or
+ *  0 when it carries no parseable timestamp. Same precedence the sidebar
+ *  orders by: last turn, then last row, then birth. */
+function slotActivityEpoch(s: { last_turn_ts?: string; last_ts?: string; created?: string }): number {
+  const ms = Date.parse(s.last_turn_ts || s.last_ts || s.created || '')
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : 0
+}
 // Module-level so the resize hook's memoised resolver isn't invalidated every render.
 const loadRosterWidth = () => loadColumnWidth(ROSTER_WIDTH_KEY, ROSTER_MIN, ROSTER_MAX, ROSTER_DEFAULT)
 
@@ -161,6 +170,29 @@ export default function MembersPage() {
   }, [members, filter])
   const activeSlot = active ? slots[active.name] ?? '' : ''
   const activeError = active ? errors[active.name] ?? '' : ''
+
+  // Sessions this member is driving: every live slot whose `created_by` is the
+  // member's DM slot key. A member dispatches its real work into worker
+  // sessions it opens via session_create and steers via session_send, and the
+  // backend fences a member caller to the slots it created — so "created by"
+  // IS "driven by", and the durable birth attribution is the whole source of
+  // truth (no transcript scraping for the `[sent by session …]` prefix). Rides
+  // the already-subscribed WS `slots` frames, which is also what gives each row
+  // its live status — the same running / needs-approval / needs-input signals
+  // the sidebar dot reads. Newest activity first; a closed worker leaves the
+  // live slots and therefore this list, which is the honest reading of
+  // "driving right now".
+  const activeMemberKey = activeSlot || active?.slot_key || ''
+  const drivingSessions = useMemo(() => {
+    if (!activeMemberKey) return []
+    return liveSlots
+      .filter((s) => !!s.created_by && s.created_by === activeMemberKey)
+      .sort((a, b) => slotActivityEpoch(b) - slotActivityEpoch(a))
+  }, [liveSlots, activeMemberKey])
+  // Collapsed past DRIVING_VISIBLE rows; the toggle is per page, not per
+  // member — the drawer reopens collapsed, which is the calmer default.
+  const [drivingExpanded, setDrivingExpanded] = useState(false)
+  const visibleDriving = drivingExpanded ? drivingSessions : drivingSessions.slice(0, DRIVING_VISIBLE)
 
   // Recent-activity pointers for the drawer, fetched when it opens for a
   // member and cached for the page's lifetime. Keyed by the exact member
@@ -618,6 +650,66 @@ export default function MembersPage() {
               <div className="text-[11px] text-muted">{t('pages.membersPage.stat_week')}</div>
             </div>
           </div>
+          {/* Sessions this member is driving — the worker sessions it opened
+              and steers. Live rows off the WS slots frames (see the
+              drivingSessions memo); each row is a jump into that session.
+              The status dot is the sidebar's vocabulary: approval (warn) >
+              needs input (info) > running (ok) > idle (muted). */}
+          <div className="text-[11px] font-semibold tracking-wide text-muted mb-1.5">
+            {t('pages.membersPage.driving_sessions')}
+          </div>
+          {drivingSessions.length === 0 ? (
+            <div className="text-[11px] text-muted mb-4" data-testid="member-driving-empty">
+              {t('pages.membersPage.driving_none')}
+            </div>
+          ) : (
+            <div className="mb-4">
+              <ul className="list-none m-0 p-0 space-y-0.5" data-testid="member-driving-sessions">
+                {visibleDriving.map((s) => {
+                  const status = s.pending_approval
+                    ? { kind: 'approval', cls: 'fill-warn text-warn', label: t('pages.chatSidebar.needs_approval') }
+                    : s.needs_input
+                      ? { kind: 'input', cls: 'fill-info text-info', label: t('pages.chatSidebar.needs_your_answer') }
+                      : s.running
+                        ? { kind: 'running', cls: 'fill-ok text-ok', label: t('pages.membersPage.drawer_working') }
+                        : { kind: 'idle', cls: 'fill-muted text-muted', label: t('pages.membersPage.driving_idle') }
+                  // Slot timestamps are ISO strings; timeAgo wants epoch seconds.
+                  const activityTs = slotActivityEpoch(s)
+                  return (
+                    <li key={s.key}>
+                      <button
+                        type="button"
+                        onClick={() => navigate(`/chat?sid=${encodeURIComponent(s.key)}`)}
+                        className="w-full text-left flex items-center gap-2 text-[11px] px-1.5 py-1 -mx-1.5 rounded hover:bg-accent/40"
+                        data-testid="member-driving-row"
+                        data-status={status.kind}
+                      >
+                        <Circle size={8} className={`shrink-0 ${status.cls}`} aria-hidden />
+                        <span className="sr-only">{status.label}</span>
+                        <span className="min-w-0 truncate flex-1">{s.title || s.key}</span>
+                        {activityTs > 0 && (
+                          <span className="text-muted shrink-0 whitespace-nowrap">{timeAgo(activityTs)}</span>
+                        )}
+                      </button>
+                    </li>
+                  )
+                })}
+              </ul>
+              {drivingSessions.length > DRIVING_VISIBLE && (
+                <button
+                  type="button"
+                  onClick={() => setDrivingExpanded((v) => !v)}
+                  className="mt-1 text-[11px] text-muted hover:text-text"
+                  aria-expanded={drivingExpanded}
+                  data-testid="member-driving-toggle"
+                >
+                  {drivingExpanded
+                    ? t('pages.membersPage.driving_show_less')
+                    : t('pages.membersPage.driving_show_all', { count: drivingSessions.length })}
+                </button>
+              )}
+            </div>
+          )}
           <div className="text-[11px] font-semibold tracking-wide text-muted mb-1.5">
             {t('pages.membersPage.recent_activity')}
           </div>

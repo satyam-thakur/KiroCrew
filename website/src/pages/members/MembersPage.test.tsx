@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { screen, fireEvent, waitFor, act } from '@testing-library/react'
 import { renderWithProviders } from '../../test/helpers'
-import { markSlotUnread } from '../../store/dashboardSlice'
+import { markSlotUnread, sseSlots } from '../../store/dashboardSlice'
 
 /* ── api client mock ─────────────────────────────────────────────────────
  * The page reads exactly two endpoints; mocking them keeps every case
@@ -460,5 +460,95 @@ describe('MembersPage unread drain', () => {
     fireEvent.click(await screen.findByText('oncall'))
     await screen.findByTestId('chat-pane-stub')
     await waitFor(() => expect(screen.queryByTestId('member-unread-dot')).toBeNull())
+  })
+})
+
+describe('MembersPage drawer — driving sessions', () => {
+  // The member operating model: the DM thread dispatches work into worker
+  // sessions it opens (session_create) and steers (session_send). The backend
+  // fences a member caller to the slots it created, so `created_by` on the
+  // live slots frame IS the driven set — the drawer filters on it, no
+  // endpoint, no transcript scraping.
+  const worker = (key: string, overrides: Record<string, unknown> = {}) => ({
+    key,
+    title: `Worker ${key}`,
+    messages: 3,
+    running: false,
+    created_by: 'member-oncall',
+    created: '2026-09-04T10:00:00Z',
+    last_turn_ts: '2026-09-04T12:00:00Z',
+    ...overrides,
+  })
+
+  async function openDrawer(liveSlots: ReturnType<typeof worker>[]) {
+    const utils = await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
+    act(() => {
+      utils.store.dispatch(sseSlots(liveSlots as never))
+    })
+    fireEvent.click(await screen.findByText('oncall'))
+    await screen.findByTestId('member-drawer')
+    return utils
+  }
+
+  it('renders the empty state when no live slot was created by the member', async () => {
+    await openDrawer([
+      // Someone else's worker and a person's own tab: neither belongs here.
+      worker('chat-1-other', { created_by: 'member-research' }),
+      worker('chat-1-own', { created_by: '' }),
+    ])
+    expect(screen.getByTestId('member-driving-empty')).toHaveTextContent(/not driving any sessions/i)
+    expect(screen.queryByTestId('member-driving-row')).toBeNull()
+  })
+
+  it('lists only the sessions this member created, newest activity first, with the sidebar status vocabulary', async () => {
+    await openDrawer([
+      worker('chat-1-idle', { last_turn_ts: '2026-09-04T09:00:00Z' }),
+      worker('chat-1-running', { running: true, last_turn_ts: '2026-09-04T11:00:00Z' }),
+      worker('chat-1-approval', { running: true, pending_approval: true, last_turn_ts: '2026-09-04T12:00:00Z' }),
+      worker('chat-1-input', { needs_input: true, last_turn_ts: '2026-09-04T10:00:00Z' }),
+      worker('chat-1-foreign', { created_by: 'member-research', last_turn_ts: '2026-09-04T13:00:00Z' }),
+    ])
+    const rows = screen.getAllByTestId('member-driving-row')
+    expect(rows.map((r) => r.textContent)).toEqual([
+      expect.stringContaining('Worker chat-1-approval'),
+      expect.stringContaining('Worker chat-1-running'),
+      expect.stringContaining('Worker chat-1-input'),
+      expect.stringContaining('Worker chat-1-idle'),
+    ])
+    // Approval outranks running (the sidebar's precedence): a running turn
+    // parked on a tool gate is "needs approval", not "working".
+    expect(rows.map((r) => r.getAttribute('data-status'))).toEqual(['approval', 'running', 'input', 'idle'])
+    expect(rows[0]).toHaveTextContent(/needs approval/i)
+    expect(rows[2]).toHaveTextContent(/needs your answer/i)
+    expect(screen.queryByTestId('member-driving-empty')).toBeNull()
+    expect(screen.queryByTestId('member-driving-toggle')).toBeNull()
+  })
+
+  it('a row is a jump into that session', async () => {
+    await openDrawer([worker('chat-1-w')])
+    fireEvent.click(screen.getByTestId('member-driving-row'))
+    expect(navigateSpy).toHaveBeenCalledWith('/chat?sid=chat-1-w')
+  })
+
+  it('folds past five rows behind a Show-all toggle that expands and collapses', async () => {
+    await openDrawer(Array.from({ length: 7 }, (_, i) => worker(`chat-1-w${i}`)))
+    expect(screen.getAllByTestId('member-driving-row')).toHaveLength(5)
+    const toggle = screen.getByTestId('member-driving-toggle')
+    expect(toggle).toHaveTextContent('Show all (7)')
+    expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    fireEvent.click(toggle)
+    expect(screen.getAllByTestId('member-driving-row')).toHaveLength(7)
+    expect(toggle).toHaveTextContent(/show less/i)
+    fireEvent.click(toggle)
+    expect(screen.getAllByTestId('member-driving-row')).toHaveLength(5)
+  })
+
+  it('a worker closing (leaving the live slots) drops out of the list live', async () => {
+    const { store } = await openDrawer([worker('chat-1-a'), worker('chat-1-b')])
+    expect(screen.getAllByTestId('member-driving-row')).toHaveLength(2)
+    act(() => {
+      store.dispatch(sseSlots([worker('chat-1-a')] as never))
+    })
+    await waitFor(() => expect(screen.getAllByTestId('member-driving-row')).toHaveLength(1))
   })
 })
