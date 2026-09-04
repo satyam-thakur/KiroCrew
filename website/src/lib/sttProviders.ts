@@ -145,14 +145,57 @@ export function streamErrorMessage(code: string, detail = ''): string {
 }
 
 /**
+ * Localised "downloading the audio decoder, N% (x of y)" line.
+ *
+ * A separate key from the model transfer's, not a shared "downloading {{what}}"
+ * with a substituted noun: a sentence assembled from a translated fragment
+ * inflects wrongly in most of the twelve languages, and these two transfers can
+ * be in flight at the same time — so each bar has to name what it is.
+ */
+export function decoderDownloadLabel(download: { done: number; total: number }): string {
+  return i18nT('lib.sttProviders.downloading_decoder', {
+    done: fmtBytes(download.done),
+    total: fmtBytes(download.total),
+    pct: fmtPercent(downloadRatio(download), { maximumFractionDigits: 0 }),
+  })
+}
+
+/**
+ * The prompt handed to an agent session when the decoder fetch has failed.
+ *
+ * A catalog value, not a template built here, because the whole thing is text the
+ * user reads in the composer before they press send — so it is translated like any
+ * other copy, and a reader who works in Japanese is not asked to approve a
+ * paragraph of English. The variables are the four facts the agent cannot
+ * otherwise obtain from the page: the machine-readable failure `code`, the
+ * backend's own `detail`, and the GATEWAY's OS and architecture (which are not the
+ * browser's — the dashboard may be open against a remote host).
+ *
+ * `detail` can be empty when a failure carried only a code, and an empty
+ * interpolation would read as a dangling dash; the code alone is substituted then.
+ */
+export function decoderRepairPrompt(failure: {
+  code: string
+  detail: string
+  os: string
+  arch: string
+}): string {
+  return i18nT('pages.settings.sttSettings.decoder_agent_prompt', {
+    code: failure.code || i18nT('pages.settings.sttSettings.decoder_failure_unknown'),
+    detail: failure.detail || i18nT('pages.settings.sttSettings.decoder_failure_unknown'),
+    os: failure.os,
+    arch: failure.arch,
+  })
+}
+
+/**
  * Fraction of a model transfer that has arrived, in [0, 1].
  *
  * A zero `total` means the transfer has been announced but its size has not been
  * reported yet, so this answers 0 rather than dividing by it. One owner for that
  * guard, because the settings panel draws a progress bar from the same number the
  * label below renders as a percentage.
- */
-export function downloadRatio(download: { done: number; total: number }): number {
+ */export function downloadRatio(download: { done: number; total: number }): number {
   return download.total > 0 ? download.done / download.total : 0
 }
 
