@@ -4170,6 +4170,7 @@ def cleanup_stale_sandbox_profiles(*, legacy_dir: str | None = None) -> int:
             pass
 
     removed += _cleanup_stale_sandbox_mount_sources()
+    removed += _cleanup_legacy_mount_source_residue()
     removed += _cleanup_retired_acp_snapshot_dir()
     return removed
 
@@ -4197,7 +4198,11 @@ def _mount_source_candidate_roots() -> list[str]:
     return roots
 
 
-def _mount_pinned_source_names(proc_root: str = "/proc") -> tuple[set[str], bool]:
+def _mount_pinned_source_names(
+    proc_root: str = "/proc",
+    *,
+    matcher: Callable[[str], bool] | None = None,
+) -> tuple[set[str], bool]:
     """Entry names of sandbox mount sources referenced by a live mount, plus
     whether the scan positively covered every namespace a PROCESS could be
     binding one from.
@@ -4221,7 +4226,11 @@ def _mount_pinned_source_names(proc_root: str = "/proc") -> tuple[set[str], bool
     - The listing must show pid 1. ``hidepid``/``subset=pid`` procfs hides
       other users' processes entirely — including a root holder that entered
       a sandbox namespace — and pid 1 always exists, so its absence proves
-      the listing is filtered and the scan reports incomplete.
+      the listing is filtered and the scan reports incomplete. It still reads
+      every pid the filtered listing DOES show (this uid's own processes are
+      never hidden from it, and every sandbox descendant keeps this uid), so
+      the pins a visible holder contributes reach the caller regardless: the
+      directory gate honours ``pinned`` before any other evidence.
     - A holder can fork a successor and exit between the pid listing and its
       own mountinfo read (the read then raises FileNotFoundError). The
       successor was forked BEFORE the exit, so it is visible to the very next
@@ -4274,21 +4283,35 @@ def _mount_pinned_source_names(proc_root: str = "/proc") -> tuple[set[str], bool
     getuid = getattr(os, "getuid", None)
     own_uid = getuid() if getuid is not None else None
     overflow_uid = _overflow_uid()
+    # Default: the keyed ``kirocrew_sb_<pid>_`` shape. ``matcher`` lets the
+    # legacy-residue sweep reuse this traversal — and, critically, its coverage
+    # accounting (zombie leaders via task/, the vanish re-listing, the
+    # foreign-uid forgiveness) — for a different name shape, instead of a
+    # second scan that gets those cases subtly wrong.
+    match = matcher or (lambda name: name.startswith(_MOUNT_SOURCE_PREFIX))
+    # Fast pre-filter per line; only valid for the default shape, since a
+    # custom matcher may accept names without the prefix.
+    line_hint = _MOUNT_SOURCE_PREFIX if matcher is None else None
 
     def _collect(mountinfo_path: str) -> None:
-        """Add every prefix-shaped bind SOURCE named in one mountinfo to ``pinned``.
+        """Add every matching bind SOURCE named in one mountinfo to ``pinned``.
 
         Propagates ``OSError`` exactly as ``open`` would, so each caller decides
-        what an unreadable task means for coverage.
+        what an unreadable task means for coverage. A source removed while
+        still bound reads ``.../name//deleted``; the suffix is stripped so the
+        real name is what pins.
         """
         with open(mountinfo_path, encoding="utf-8", errors="replace") as fh:
             for line in fh:
-                if _MOUNT_SOURCE_PREFIX not in line:
+                if line_hint is not None and line_hint not in line:
                     continue
                 fields = line.split()
                 if len(fields) > 3:
-                    source = os.path.basename(fields[3])
-                    if source.startswith(_MOUNT_SOURCE_PREFIX):
+                    source = fields[3]
+                    if source.endswith("//deleted"):
+                        source = source[: -len("//deleted")]
+                    source = os.path.basename(source)
+                    if match(source):
                         pinned.add(source)
 
     for _ in range(_PIN_SCAN_MAX_PASSES):
@@ -4297,7 +4320,15 @@ def _mount_pinned_source_names(proc_root: str = "/proc") -> tuple[set[str], bool
         except OSError:
             return pinned, False
         if "1" not in listed and "1" not in seen:
-            return pinned, False  # filtered procfs (hidepid/subset) — coverage unprovable
+            # Filtered procfs (hidepid/subset): coverage is unprovable, but the
+            # pids that ARE listed — this uid's own, which is where every
+            # sandbox descendant lives — still read fine and still pin. Keep
+            # walking so their pins reach the caller: the directory gate checks
+            # ``entry in pinned`` BEFORE it consults the per-entry group probe,
+            # so a visible holder retains its source even when its staging group
+            # is gone. Returning here instead would hand the gate an empty set
+            # and let a ``setsid()`` descendant's live bind be reclaimed.
+            complete = False
         new_pids = [n for n in listed if n not in seen]
         vanished = False
         for name in new_pids:
@@ -4392,6 +4423,55 @@ def _mount_pinned_source_names(proc_root: str = "/proc") -> tuple[set[str], bool
     return pinned, False  # still churning after the pass budget — coverage unproven
 
 
+def _staging_tree_gone(pid: int) -> bool:
+    """Whether the process GROUP that staged a ``kirocrew_sb_<pid>_`` entry is gone.
+
+    The second, PER-ENTRY line of evidence for directory reclamation, standing
+    beside the host-wide pin scan rather than replacing it.
+
+    A staged source can only be bind-mounted inside the mount namespace its
+    own launcher created, and every launcher names its sources with its own
+    pid — so an entry named for pid P is reachable from P's namespace alone.
+    That namespace outlives P only through a descendant, and the launcher is
+    spawned with ``start_new_session=True``, which makes P the group leader
+    every ordinary descendant inherits. A kernel "no such process group"
+    answer is therefore a POSITIVE statement that nothing can still bind this
+    entry, and unlike the pin scan's coverage flag it does not require having
+    read every pid's mountinfo — a requirement unbounded spawn churn keeps
+    that flag from ever satisfying, which is how the directory class came to
+    accumulate without bound on busy hosts.
+
+    Conservative in the same direction as the probe it wraps:
+    :func:`platform_compat.pgroup_exists` reads an unsignalable group as ALIVE
+    (EPERM), so only ESRCH reaches "gone", and an unprobeable pid reads as
+    alive. A descendant that ``setsid()``s out of the group escapes this probe
+    exactly as it escapes ``kill_process_tree`` and the agent-scratch sweep —
+    the same boundary, deliberately — and the pinned-set check still catches
+    it whenever its mountinfo is readable, which is a strictly stronger
+    guarantee than the file branch has ever had (files are removed with no pin
+    gate at all, their inode being held by the mount like an open descriptor).
+    """
+    try:
+        return not platform_compat.pgroup_exists(pid)
+    except (OverflowError, OSError):
+        return False  # unprobeable — read as alive and keep the entry
+
+
+#: Wall-clock budget for ONE reclaim pass, keyed and legacy alike. A pile that
+#: cannot be cleared inside it is left for the next pass: the sweep runs on the
+#: maintenance executor, whose threads other housekeeping shares, and reclaim is
+#: resumable by construction (each entry is decided independently, and nothing
+#: depends on a pass finishing). Measured for scale: 939k directories took ~11s
+#: on tmpfs, so this clears a normal backlog in one pass and spreads a
+#: pathological one over a few, instead of occupying a worker for a minute.
+_SWEEP_TIME_BUDGET_SECONDS = 10.0
+
+#: How often the budget is consulted. A clock read per entry would be a
+#: measurable share of the work at these counts; per batch is close enough for a
+#: budget whose only job is to bound the pass.
+_SWEEP_BUDGET_CHECK_EVERY = 4096
+
+
 def _cleanup_stale_sandbox_mount_sources(*, roots: Sequence[str] | None = None) -> int:
     """Reclaim orphaned bind-mount sources staged by the namespace launcher.
 
@@ -4417,18 +4497,27 @@ def _cleanup_stale_sandbox_mount_sources(*, roots: Sequence[str] | None = None) 
     - Plain files: ``os.remove``. A file source's inode is held by the mount
       like an open descriptor, so the masked view is unaffected.
     - Dirs, empty or not: removed only when no readable mount namespace
-      references the entry AND the pin scan positively covered every
-      namespace that could bind one (:func:`_mount_pinned_source_names`).
-      The pin scan, not the pid probe, is the deciding evidence: a recycled
-      pid reads live yet has no mount, so its entry is still reclaimed after
-      the age backstop rather than stranded, while a genuine long-lived
-      sandbox is pinned by its own process and kept. A namespace no PROCESS
-      holds has no mountinfo to report a pin — an fd- or bind-pinned
-      namespace with zero members is out of scope, and the launcher never
-      creates one — so the scan cannot go stale in the deleting direction. The
-      fresh-and-alive skip above stays load-bearing for the launcher's own
-      staging window (after ``mkdtemp``, before ``mount``), when its entries
-      are legitimately live and not yet pinned.
+      references the entry (:func:`_mount_pinned_source_names`) AND absence
+      of a pin is positively established — by EITHER the pin scan proving it
+      covered every namespace that could bind one, OR the entry's own staging
+      process group being gone (:func:`_staging_tree_gone`). Two independent
+      lines of evidence, because the scan's coverage flag is HOST-WIDE while
+      the question is PER-ENTRY: an entry named for pid P is reachable from
+      P's namespace alone, so churn among unrelated pids — which is what
+      sinks coverage on a busy host — says nothing about P. Requiring the
+      host-wide flag alone is what stranded the directory class permanently
+      on exactly the hosts this sweep exists for (observed: 929,540 dirs
+      retained against 511 files reclaimed, the runtime tmpfs back at 100%
+      of its inodes and every spawn failing again). A recycled pid reads live
+      yet has no mount, so its entry is still reclaimed after the age
+      backstop rather than stranded, while a genuine long-lived sandbox is
+      pinned by its own process AND holds its own group, so both signals keep
+      it. A namespace no PROCESS holds has no mountinfo to report a pin — an
+      fd- or bind-pinned namespace with zero members is out of scope, and the
+      launcher never creates one — so neither signal can go stale in the
+      deleting direction. The fresh-and-alive skip above stays load-bearing
+      for the launcher's own staging window (after ``mkdtemp``, before
+      ``mount``), when its entries are legitimately live and not yet pinned.
 
     Deliberately conservative about names: only the recognized
     ``kirocrew_sb_<pid>_`` shape with an ASCII positive pid is touched.
@@ -4445,6 +4534,9 @@ def _cleanup_stale_sandbox_mount_sources(*, roots: Sequence[str] | None = None) 
         Number of entries removed.
     """
     now = time.time()
+    started = time.monotonic()
+    examined = 0
+    budget_spent = False
     if roots is None:
         roots = _mount_source_candidate_roots()
     # (pinned set, scan-was-complete) — built lazily, once, on the first
@@ -4453,6 +4545,8 @@ def _cleanup_stale_sandbox_mount_sources(*, roots: Sequence[str] | None = None) 
     removed = 0
     dirs_held_back = 0
     for root in roots:
+        if budget_spent:
+            break
         try:
             entries = os.listdir(root)
         except OSError:
@@ -4460,6 +4554,15 @@ def _cleanup_stale_sandbox_mount_sources(*, roots: Sequence[str] | None = None) 
         for entry in entries:
             if not entry.startswith(_MOUNT_SOURCE_PREFIX):
                 continue
+            examined += 1
+            if examined % _SWEEP_BUDGET_CHECK_EVERY == 0 and (
+                time.monotonic() - started
+            ) > _SWEEP_TIME_BUDGET_SECONDS:
+                # Out of budget: stop cleanly and let the next pass continue.
+                # Reclaim is resumable per entry, so a partial pass is progress,
+                # never an inconsistent state.
+                budget_spent = True
+                break
             pid_str, sep, _rest = entry[len(_MOUNT_SOURCE_PREFIX) :].partition("_")
             pid = _parse_pid_segment(pid_str) if sep else None
             if pid is None:
@@ -4480,11 +4583,16 @@ def _cleanup_stale_sandbox_mount_sources(*, roots: Sequence[str] | None = None) 
                 continue
             if os.path.isdir(path) and not os.path.islink(path):
                 # ANY dir removal — even rmdir of an empty one — S_DEADs a
-                # live mount's root inode, so the pin scan gates it all.
+                # live mount's root inode, so absence of a pin must be
+                # POSITIVELY established. Either line of evidence does that:
+                # the host-wide scan proving its coverage, or this entry's own
+                # staging group being gone. Requiring the host-wide flag alone
+                # retains the class forever wherever spawn churn keeps the
+                # scan from settling.
                 if pin_scan is None:
                     pin_scan = _mount_pinned_source_names()
                 pinned, scan_complete = pin_scan
-                if entry in pinned or not scan_complete:
+                if entry in pinned or not (scan_complete or _staging_tree_gone(pid)):
                     dirs_held_back += 1
                     continue
                 try:
@@ -4514,15 +4622,247 @@ def _cleanup_stale_sandbox_mount_sources(*, roots: Sequence[str] | None = None) 
         scan_complete = pin_scan is not None and pin_scan[1]
         # WARNING for the incomplete case, INFO for the benign pinned one.
         # Holding entries back because a live namespace binds them is normal
-        # operation; holding them back because coverage is unprovable is a
-        # FAULT that stops directory reclamation host-wide until the runtime
-        # tmpfs is out of inodes. At INFO it also does not reach a default
-        # deployment's log at all, which is how the leak this guards against
-        # ran unobserved while this very line fired on every sweep.
+        # operation; holding them back on an unprovable scan is a FAULT — now
+        # survivable, because a candidate whose staging group is gone is
+        # reclaimed anyway, so what remains here is confined to entries whose
+        # tree still looks alive.
         (logger.info if scan_complete else logger.warning)(
             "sandbox mount-source sweep: %d dir candidate(s) held back (%s)",
             dirs_held_back,
-            ("pinned by a live mount namespace" if scan_complete else "pin scan incomplete"),
+            (
+                "pinned by a live mount namespace"
+                if scan_complete
+                else "pin scan incomplete and the staging process group still reads alive"
+            ),
+        )
+    if budget_spent:
+        logger.info(
+            "sandbox mount-source sweep: paused at the %.0fs budget after %d entries "
+            "(%d reclaimed this pass); the next pass resumes",
+            _SWEEP_TIME_BUDGET_SECONDS,
+            examined,
+            removed,
+        )
+    return removed
+
+
+#: Pre-#6268 builds staged their bind-mount sources with ``tempfile``'s DEFAULT
+#: names, so those entries carry no pid and the pid-keyed sweep above cannot
+#: reason about them at all. Every install that upgraded through that change
+#: therefore carries a permanent pile — 1,836,596 entries measured on one host,
+#: enough on its own to exhaust the runtime tmpfs's inodes and stop every
+#: ``systemd-run --scope``-wrapped spawn. This is ``tempfile``'s exact shape:
+#: the ``tmp`` prefix plus 8 characters of its own alphabet.
+_LEGACY_MOUNT_SOURCE_RE = re.compile(r"^tmp[a-z0-9_]{8}$")
+
+#: How many legacy-shaped candidates a root must hold before the legacy pass
+#: touches ANY of them. An unkeyed name carries no provenance, so the pile IS
+#: the provenance: no program's ordinary scratch use leaves dozens of empty,
+#: 0o700, day-old ``tmp*`` directories in the session runtime dir, whereas the
+#: leak this pass exists for left 1.8 million on one host. Below the threshold
+#: every candidate is retained and the pass retires — there is no pile to heal.
+_LEGACY_PILE_THRESHOLD = 64
+
+#: Written once a legacy pass has completed, so the scan is not repeated for the
+#: life of the install: no current build creates these names, so a completed
+#: pass is final.
+_LEGACY_RESIDUE_MARKER = ".legacy-mount-source-residue-swept"
+
+
+def _launcher_tmpfs_roots() -> list[str]:
+    """The root the legacy pass may walk: the session runtime dir alone.
+
+    Deliberately narrower than :func:`_mount_source_candidate_roots`. The legacy
+    sweep matches an unkeyed ``tmp*`` name, so it may only walk a root where
+    that shape is far more likely ours than a stranger's. ``/run/user/$UID`` is
+    the launcher's first pick, is scoped to this uid's login session (nothing
+    keeps durable state there), and is where the observed pile lived.
+    ``/dev/shm`` is NOT walked even though the launcher falls back to it: it is
+    a host-wide tmpfs where any same-uid program's ``tempfile`` scratch
+    legitimately lives, and an empty day-old scratch dir there can still be a
+    live program's — a host whose launcher fell back to ``/dev/shm`` keeps the
+    manual note in the issue instead. The shared system tempdir is excluded
+    for the same reason, more so.
+    """
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        return []
+    return [f"/run/user/{getuid()}"]
+
+
+def _bound_source_basenames(proc_root: str = "/proc") -> tuple[set[str], bool]:
+    """Basenames of legacy-shaped bind sources named by any live mount, plus
+    whether coverage was positively established.
+
+    The same traversal as :func:`_mount_pinned_source_names` — zombie leaders
+    consulted through ``task/``, the vanish re-listing, foreign-uid forgiveness
+    — with the name predicate swapped for tempfile's shape, because the legacy
+    residue carries no recognizable prefix. A first cut re-implemented the walk
+    and got two things wrong that this delegation cannot: it filtered on the
+    root field's DIRNAME, which is the source's path *within its own
+    filesystem* (``/tmpab12cd34``, never ``/run/user/$UID/tmpab12cd34``) so the
+    fence silently matched nothing; and it reported every ``EINVAL`` as a
+    coverage gap, which on a real host with a couple of dozen zombie leaders
+    made the pass permanently inert.
+
+    Keyed by basename only, which is why no root is taken: a same-named entry
+    on another filesystem shares the pin, which errs toward retention.
+    """
+    return _mount_pinned_source_names(
+        proc_root, matcher=lambda name: bool(_LEGACY_MOUNT_SOURCE_RE.match(name))
+    )
+
+
+def _cleanup_legacy_mount_source_residue() -> int:
+    """One-shot reclaim of the pre-#6268, pid-less bind-mount source residue.
+
+    An install that upgraded past #6268 gained a sweep that can never touch what
+    the OLD build left behind, so the pile it inherited keeps the runtime tmpfs
+    at its inode ceiling and every agent spawn keeps failing — an upgrade that
+    ships the reclaim fix but not this leaves such a host exactly as broken as
+    before. Runs from the same entry point as the keyed sweep, so the gateway's
+    first cleanup pass after an update heals the host without an operator ever
+    learning what ``Failed to start transient scope unit: No space left on
+    device`` meant.
+
+    An unkeyed name cannot be PROVEN to be ours, so every fence here is about
+    keeping a stranger's entry rather than reclaiming ours:
+
+    - only on the session runtime tmpfs the launcher picks first
+      (:func:`_launcher_tmpfs_roots`), never ``/dev/shm`` or the shared system
+      tempdir, where another same-uid program's ``tempfile`` scratch lives;
+    - only ``tempfile``'s exact shape (:data:`_LEGACY_MOUNT_SOURCE_RE`);
+    - only entries owned by THIS uid, with the exact mode ``mkdtemp``/
+      ``mkstemp`` create (0o700 / 0o600) — a hand-made or umask-shaped entry
+      is not one of these;
+    - only past ``_MOUNT_SOURCE_MAX_AGE_SECONDS``, which every real member of
+      this class is by construction (no build has created the shape since
+      #6268) while a live program's scratch dir usually is not;
+    - only when no live mount names the entry as its source, and only when
+      that absence was POSITIVELY established (:func:`_bound_source_basenames`);
+    - only once a root shows the PILE this pass exists for
+      (:data:`_LEGACY_PILE_THRESHOLD` candidates passing every fence above):
+      a stray scratch dir or two never trips it and is retained outright,
+      while the leak class arrives by the hundred thousand;
+    - dirs go through ``os.rmdir``, which REFUSES a non-empty directory: that
+      is the emptiness fence, so a populated stranger's dir survives without a
+      listing, and so does the legacy SSH shadow dir (it holds a known-hosts
+      copy) — left for the human note in the issue rather than removed here.
+
+    Returns:
+        Number of entries removed.
+    """
+    marker = config_dir() / _LEGACY_RESIDUE_MARKER
+    try:
+        if marker.exists():
+            return 0
+    except OSError:
+        return 0
+    roots = _launcher_tmpfs_roots()
+    bound, complete = _bound_source_basenames()
+    if not complete:
+        # Absence-of-bind not established — retry on the next sweep rather than
+        # remove on the strength of an incomplete scan, and do NOT stamp the
+        # marker, or one bad scan would retire the pass forever.
+        return 0
+    now = time.time()
+    started = time.monotonic()
+    examined = 0
+    budget_spent = False
+    getuid = getattr(os, "getuid", None)
+    own_uid = getuid() if getuid is not None else None
+    removed = 0
+
+    def _reclaim(path: str, is_dir: bool) -> bool:
+        try:
+            if is_dir:
+                os.rmdir(path)  # refuses a non-empty dir by design
+            else:
+                os.remove(path)
+        except OSError:
+            return False
+        return True
+
+    for root in roots:
+        if budget_spent:
+            break
+        try:
+            entries = os.scandir(root)
+        except OSError:
+            continue
+        # Candidates are buffered until the root proves it holds the pile;
+        # below the threshold nothing in the buffer is touched. Once it is
+        # reached the buffer is drained and reclaim streams from then on.
+        pending: list[tuple[str, bool]] = []
+        engaged = False
+        with entries:
+            for entry in entries:
+                if not _LEGACY_MOUNT_SOURCE_RE.match(entry.name) or entry.name in bound:
+                    continue
+                examined += 1
+                if examined % _SWEEP_BUDGET_CHECK_EVERY == 0 and (
+                    time.monotonic() - started
+                ) > _SWEEP_TIME_BUDGET_SECONDS:
+                    budget_spent = True
+                    break
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if own_uid is not None and info.st_uid != own_uid:
+                    continue
+                if (now - info.st_mtime) <= _MOUNT_SOURCE_MAX_AGE_SECONDS:
+                    continue
+                mode = stat.S_IMODE(info.st_mode)
+                if stat.S_ISDIR(info.st_mode):
+                    if mode != 0o700:
+                        continue
+                    candidate = (entry.path, True)
+                elif stat.S_ISREG(info.st_mode):
+                    if mode != 0o600 or info.st_size:
+                        continue
+                    candidate = (entry.path, False)
+                else:
+                    continue
+                if engaged:
+                    removed += _reclaim(*candidate)
+                    continue
+                pending.append(candidate)
+                if len(pending) >= _LEGACY_PILE_THRESHOLD:
+                    engaged = True
+                    for queued in pending:
+                        removed += _reclaim(*queued)
+                    pending = []
+        if pending and not engaged:
+            logger.info(
+                "sandbox mount-source sweep: %d legacy-shaped entries under %s are below "
+                "the pile threshold (%d); retained as not provably ours",
+                len(pending),
+                root,
+                _LEGACY_PILE_THRESHOLD,
+            )
+    if budget_spent:
+        logger.info(
+            "sandbox mount-source sweep: legacy pass paused at the %.0fs budget after "
+            "%d entries (%d reclaimed); the next pass resumes",
+            _SWEEP_TIME_BUDGET_SECONDS,
+            examined,
+            removed,
+        )
+    else:
+        # Stamp only a pass that actually reached the end of the residue, or the
+        # remainder of a budget-truncated walk would be retired unswept.
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(f"{int(now)} removed={removed}\n", encoding="utf-8")
+        except OSError:
+            # An unstampable marker only costs a repeat pass, which is idempotent.
+            logger.debug("legacy mount-source sweep: could not stamp %s", marker, exc_info=True)
+    if removed:
+        logger.info(
+            "sandbox mount-source sweep: reclaimed %d pre-prefix legacy entries "
+            "(one-shot; these carry no pid and no earlier build could reclaim them)",
+            removed,
         )
     return removed
 

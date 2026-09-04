@@ -16,12 +16,18 @@ Two halves lock the fix in:
       drift above the fork, at every sandbox level, with the script staying
       parseable;
   (b) ``_cleanup_stale_sandbox_mount_sources`` reclaims layered by cost: plain
-      files and empty dirs on dead pid or over-age; non-empty dirs (contents
-      are visible inside a live mount namespace) only when the mountinfo pin
-      scan positively establishes no namespace references the entry — the pin
-      scan, not the pid probe, is the deciding evidence, so a recycled pid is
-      reclaimed while a genuine long-lived sandbox is kept. Foreign ``tmp*``
-      names, probe names, planted hostile pid segments, and
+      files and empty dirs on dead pid or over-age; dirs (whose contents are
+      visible inside a live mount namespace, and whose removal S_DEADs it)
+      only once absence-of-pin is POSITIVELY established — by the mountinfo
+      pin scan proving host-wide coverage, or by the entry's own staging
+      process group being gone, an entry named for pid P being bindable from
+      P's namespace alone. Two signals because one is host-wide and the
+      question is per-entry: unrelated spawn churn sinks the scan's coverage
+      forever on a busy host, and requiring it alone retained the directory
+      class until the runtime tmpfs ran out of inodes again. A readable pin
+      always outranks the group probe, a recycled pid is reclaimed rather than
+      stranded, and a genuine long-lived sandbox is kept by both. Foreign
+      ``tmp*`` names, probe names, planted hostile pid segments, and
       ``kirocrew_sandbox_*`` launcher scripts are preserved, without the sweep
       ever raising.
 """
@@ -44,6 +50,7 @@ import pytest
 from kiro_crew.sandbox import (
     _MOUNT_SOURCE_MAX_AGE_SECONDS,
     _build_launcher_script,
+    _cleanup_legacy_mount_source_residue,
     _cleanup_stale_sandbox_mount_sources,
     _mount_pinned_source_names,
     cleanup_stale_sandbox_profiles,
@@ -85,6 +92,20 @@ def _pin(monkeypatch: pytest.MonkeyPatch, names: set[str], *, complete: bool = T
     monkeypatch.setattr(
         "kiro_crew.sandbox._mount_pinned_source_names",
         lambda proc_root="/proc": (names, complete),
+    )
+
+
+def _staging_group(monkeypatch: pytest.MonkeyPatch, *, alive: bool) -> None:
+    """Fix the staging process GROUP probe's answer for one test.
+
+    The real probe is ``platform_compat.pgroup_exists``; a synthetic pid has no
+    group to make alive on purpose, and a REAL live group would be this test
+    runner's own, whose lifetime the test cannot control. Patched at the
+    ``platform_compat`` attribute the sweep looks up at call time.
+    """
+    monkeypatch.setattr(
+        "kiro_crew.platform_compat.pgroup_exists",
+        lambda pgid: alive,
     )
 
 
@@ -197,17 +218,19 @@ class TestMountSourceSweep:
         assert removed == 1
         assert not recycled.exists()
 
-    def test_incomplete_pin_scan_blocks_dir_removal(
+    def test_incomplete_pin_scan_blocks_dir_removal_while_the_group_reads_alive(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         """Absence-of-pin must be POSITIVELY established before any dir goes.
 
-        A partial /proc scan (fd exhaustion, an unmappable-uid holder) cannot
-        prove an entry is unreferenced, so the sweep must fail closed for
-        dirs — empty ones included, since rmdir of a live source S_DEADs the
-        mount — while plain files are unaffected by the scan.
+        With NEITHER line of evidence available — a partial /proc scan (fd
+        exhaustion, an unmappable-uid holder) and a staging group that still
+        reads alive — the sweep must fail closed for dirs, empty ones included,
+        since rmdir of a live source S_DEADs the mount. Plain files are
+        unaffected by the scan.
         """
         _pin(monkeypatch, set(), complete=False)
+        _staging_group(monkeypatch, alive=True)
         held = _make_dir(tmp_path, f"kirocrew_sb_{_DEAD_PID}_part01", populate=True)
         empty = _make_dir(tmp_path, f"kirocrew_sb_{_DEAD_PID}_part03")
         plain = _make_file(tmp_path, f"kirocrew_sb_{_DEAD_PID}_part02")
@@ -218,6 +241,73 @@ class TestMountSourceSweep:
         assert (held / "known_hosts").exists()
         assert empty.exists()
         assert not plain.exists()
+
+    def test_incomplete_pin_scan_still_reclaims_dirs_whose_staging_group_is_gone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The host-wide coverage flag must not gate a per-entry question.
+
+        An entry named for pid P is bindable only from P's own namespace, which
+        survives P only through a group member — so a kernel "no such process
+        group" answer establishes absence-of-pin for THIS entry no matter how
+        much unrelated spawn churn stops the scan from proving host-wide
+        coverage. Requiring the flag alone stranded the whole directory class
+        on every busy host (observed: 929,540 dirs retained against 511 files
+        reclaimed, runtime tmpfs at 100% of its inodes, every spawn failing
+        with "Failed to start transient scope unit: No space left on device").
+        """
+        _pin(monkeypatch, set(), complete=False)
+        _staging_group(monkeypatch, alive=False)
+        empty = _make_dir(tmp_path, f"kirocrew_sb_{_DEAD_PID}_mask01")
+        shadow = _make_dir(tmp_path, f"kirocrew_sb_{_DEAD_PID}_ssh456", populate=True)
+
+        removed = _cleanup_stale_sandbox_mount_sources(roots=[str(tmp_path)])
+
+        assert removed == 2
+        assert not empty.exists()
+        assert not shadow.exists()
+
+    def test_pin_outranks_a_gone_staging_group(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A readable pin is evidence of a LIVE mount and always wins.
+
+        The group probe can only ever license a removal the pinned set has not
+        objected to: a namespace held by a ``setsid()``-escaped descendant
+        reads as a gone group, and its mountinfo is what still protects the
+        source.
+        """
+        pinned_name = f"kirocrew_sb_{_DEAD_PID}_pinned1"
+        pinned_dir = _make_dir(tmp_path, pinned_name, populate=True, old=True)
+        _pin(monkeypatch, {pinned_name}, complete=False)
+        _staging_group(monkeypatch, alive=False)
+
+        removed = _cleanup_stale_sandbox_mount_sources(roots=[str(tmp_path)])
+
+        assert removed == 0
+        assert (pinned_dir / "known_hosts").exists()
+
+    def test_unprobeable_staging_group_reads_alive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A probe that raises must not license a removal.
+
+        ``pgroup_exists`` is conservative on EPERM, and a corrupt pid segment
+        can overflow it; either way the entry is retained rather than removed
+        on an answer the kernel never gave.
+        """
+        _pin(monkeypatch, set(), complete=False)
+
+        def _boom(pgid: int) -> bool:
+            raise OverflowError("pid segment too large for the platform probe")
+
+        monkeypatch.setattr("kiro_crew.platform_compat.pgroup_exists", _boom)
+        empty = _make_dir(tmp_path, f"kirocrew_sb_{_DEAD_PID}_raise1")
+
+        removed = _cleanup_stale_sandbox_mount_sources(roots=[str(tmp_path)])
+
+        assert removed == 0
+        assert empty.exists()
 
     def test_preserves_fresh_live_pid_entry(self, tmp_path: Path):
         live = _make_dir(tmp_path, f"kirocrew_sb_{_LIVE_PID}_live01")
@@ -820,19 +910,49 @@ class TestMountPinnedSourceNames:
         assert pinned == set()
         assert complete is False
 
-    def test_filtered_procfs_without_pid_1_reports_incomplete(self, tmp_path: Path):
+    def test_filtered_procfs_without_pid_1_reports_incomplete_but_still_pins(
+        self, tmp_path: Path
+    ):
         """hidepid/subset=pid procfs hides other users' processes entirely —
         including a root holder — and pid 1 always exists, so a listing
-        without it proves filtering and must fail closed."""
+        without it proves filtering and must fail closed on COVERAGE.
+
+        It must NOT stop reading: this uid's own processes stay visible under
+        hidepid, and a sandbox descendant that ``setsid()``s out of its staging
+        group is exactly such a process. An early return would hand the
+        directory gate an empty pinned set, the group probe would then answer
+        "gone", and a live bind's source would be reclaimed. Caught by GPT 5.6
+        review of PR #8559.
+        """
         proc = tmp_path / "proc"
         d = proc / "106"
         d.mkdir(parents=True)
-        (d / "mountinfo").write_text("")
+        (d / "mountinfo").write_text(
+            f"1932 1355 0:55 /kirocrew_sb_{_DEAD_PID}_live1 /home/u/.ssh rw - tmpfs tmpfs rw\n"
+        )
 
         pinned, complete = _mount_pinned_source_names(proc_root=str(proc))
 
-        assert pinned == set()
         assert complete is False
+        assert pinned == {f"kirocrew_sb_{_DEAD_PID}_live1"}
+
+    def test_visible_holder_outranks_a_gone_staging_group_under_hidepid(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The directory gate: a pin from an incomplete scan still retains.
+
+        Filtered procfs (incomplete) + the staging group gone (a ``setsid()``
+        descendant) is the shape that would otherwise reclaim a live source;
+        the descendant's own mountinfo, being this uid's, is readable and its
+        pin must win.
+        """
+        name = f"kirocrew_sb_{_DEAD_PID}_setsid1"
+        _pin(monkeypatch, {name}, complete=False)
+        _staging_group(monkeypatch, alive=False)
+        held = _make_dir(tmp_path, name)
+
+        assert _cleanup_stale_sandbox_mount_sources(roots=[str(tmp_path)]) == 0
+        assert held.exists()
 
     @pytest.mark.skipif(
         not os.path.isdir("/proc/1"),
@@ -860,6 +980,326 @@ class TestMountPinnedSourceNames:
         assert complete is True
 
 
+class TestLegacyResidueSweep:
+    """The pre-#6268 ``tmp*`` residue is reclaimed once, behind every fence.
+
+    An install that upgraded past #6268 inherited a pile the keyed sweep cannot
+    reason about (no pid in the name), so shipping only the reclaim fix leaves
+    such a host at its inode ceiling and every spawn still failing. These names
+    cannot be PROVEN to be ours, so each test below pins one fence that keeps a
+    stranger's entry.
+    """
+
+    def _fence(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        root: Path,
+        *,
+        bound: set[str] | None = None,
+        complete: bool = True,
+    ) -> None:
+        monkeypatch.setattr("kiro_crew.sandbox._launcher_tmpfs_roots", lambda: [str(root)])
+        monkeypatch.setattr(
+            "kiro_crew.sandbox._bound_source_basenames",
+            lambda proc_root="/proc": (bound or set(), complete),
+        )
+        # Each test below pins ONE fence; the pile threshold has its own tests.
+        monkeypatch.setattr("kiro_crew.sandbox._LEGACY_PILE_THRESHOLD", 1)
+
+    def _legacy_dir(self, root: Path, name: str = "tmpab12cd34", *, old: bool = True) -> Path:
+        path = root / name
+        path.mkdir(mode=0o700)
+        os.chmod(path, 0o700)  # umask can shave bits off the mkdir mode  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions  # noqa: E501  # fmt: skip
+        if old:
+            stale = time.time() - _MOUNT_SOURCE_MAX_AGE_SECONDS - 100
+            os.utime(path, (stale, stale))
+        return path
+
+    def _legacy_file(self, root: Path, name: str = "tmpef56gh78", *, old: bool = True) -> Path:
+        path = root / name
+        path.write_text("")
+        os.chmod(path, 0o600)
+        if old:
+            stale = time.time() - _MOUNT_SOURCE_MAX_AGE_SECONDS - 100
+            os.utime(path, (stale, stale))
+        return path
+
+    def test_reclaims_the_unkeyed_residue_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        self._fence(monkeypatch, tmp_path)
+        empty = self._legacy_dir(tmp_path)
+        plain = self._legacy_file(tmp_path)
+
+        removed = _cleanup_legacy_mount_source_residue()
+
+        assert removed == 2
+        assert not empty.exists()
+        assert not plain.exists()
+        # Second call is a no-op: no current build creates the shape, so a
+        # completed pass is final and must not re-walk the tmpfs forever.
+        assert _cleanup_legacy_mount_source_residue() == 0
+
+    def test_unproven_bind_coverage_removes_nothing_and_does_not_retire_the_pass(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A failed scan must cost a retry, never the whole pass."""
+        self._fence(monkeypatch, tmp_path, complete=False)
+        held = self._legacy_dir(tmp_path)
+
+        assert _cleanup_legacy_mount_source_residue() == 0
+        assert held.exists()
+
+        self._fence(monkeypatch, tmp_path, complete=True)
+        assert _cleanup_legacy_mount_source_residue() == 1
+
+    def test_bound_entry_is_preserved(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Removing a live mount's source dir S_DEADs it — the bind scan decides."""
+        name = "tmpbound123"
+        self._fence(monkeypatch, tmp_path, bound={name})
+        held = self._legacy_dir(tmp_path, name)
+
+        assert _cleanup_legacy_mount_source_residue() == 0
+        assert held.exists()
+
+    def test_non_empty_dir_survives(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """``os.rmdir`` refusing a populated dir IS the emptiness fence.
+
+        It keeps both a stranger's working scratch dir and the legacy SSH shadow
+        dir, which holds a known-hosts copy.
+        """
+        self._fence(monkeypatch, tmp_path)
+        populated = self._legacy_dir(tmp_path, "tmpshadow12")
+        (populated / "known_hosts").write_text("example.com ssh-ed25519 AAAA\n")
+
+        assert _cleanup_legacy_mount_source_residue() == 0
+        assert (populated / "known_hosts").exists()
+
+    def test_bound_scan_keys_on_the_tmpfs_relative_root_field(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sandbox_sweep_original
+    ):
+        """mountinfo names a source relative to ITS filesystem, never by host path.
+
+        A source staged on the /run/user/$UID tmpfs reads as ``/tmpab12cd34``,
+        so any filter on the field's dirname matches nothing and silently
+        disarms the fence — which is exactly what the first cut of this scan did.
+        The synthetic lines below mirror a real host's (including a source
+        deleted while still bound, which reads ``//deleted``).
+        """
+        # The autouse floor pins both module attributes fail-closed; the real
+        # functions are reachable only through the conftest accessor, and the
+        # bound scan delegates to the pinned scan by NAME, so that one must be
+        # restored on the module for the delegation to reach the real walk.
+        bound_scan = sandbox_sweep_original("_bound_source_basenames")
+        monkeypatch.setattr(
+            "kiro_crew.sandbox._mount_pinned_source_names",
+            sandbox_sweep_original("_mount_pinned_source_names"),
+        )
+
+        proc = tmp_path / "proc"
+        (proc / "1").mkdir(parents=True)
+        (proc / "1" / "mountinfo").write_text("38 35 8:1 / / rw - ext4 /dev/sda1 rw\n")
+        (proc / "202").mkdir()
+        (proc / "202" / "mountinfo").write_text(
+            "1930 1355 0:55 /tmpab12cd34 /home/u/.gnupg rw,nosuid - tmpfs tmpfs rw\n"
+            "1931 1355 0:55 /tmpef56gh78//deleted /home/u/.aws rw,nosuid - tmpfs tmpfs rw\n"
+            "1932 1355 0:55 /kirocrew_sb_7_x /home/u/.ssh rw,nosuid - tmpfs tmpfs rw\n"
+            "1933 1355 0:55 /notlegacy /home/u/x rw - tmpfs tmpfs rw\n"
+        )
+
+        bound, complete = bound_scan(proc_root=str(proc))
+
+        assert complete is True
+        assert bound == {"tmpab12cd34", "tmpef56gh78"}
+
+    def test_fresh_foreign_and_wrong_shaped_entries_survive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Age, mode and name shape each keep an entry this sweep must not own."""
+        self._fence(monkeypatch, tmp_path)
+        fresh = self._legacy_dir(tmp_path, "tmpfresh1234"[:11], old=False)
+        loose = self._legacy_dir(tmp_path, "tmploose5678")
+        os.chmod(loose, 0o755)  # not a mkdtemp mode — hand-made or umask-shaped  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions  # noqa: E501  # fmt: skip
+        sized = self._legacy_file(tmp_path, "tmpsized9012")
+        sized.write_text("payload")
+        os.utime(sized, (time.time() - _MOUNT_SOURCE_MAX_AGE_SECONDS - 100,) * 2)
+        named = tmp_path / "tmp-not-mkdtemp"
+        named.mkdir(mode=0o700)
+        keyed = _make_dir(tmp_path, f"kirocrew_sb_{_DEAD_PID}_keyed01")
+
+        assert _cleanup_legacy_mount_source_residue() == 0
+        for path in (fresh, loose, sized, named, keyed):
+            assert path.exists(), path
+
+    def test_below_the_pile_threshold_everything_is_retained_and_the_pass_retires(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """An unkeyed name has no provenance; the PILE is the provenance.
+
+        A handful of empty, day-old ``tmp*`` dirs is what another same-uid
+        program's ``tempfile`` scratch looks like, and one it may still write
+        into — so below the threshold nothing is touched. There is also no
+        pile to heal, so the one-shot pass retires rather than re-walking the
+        tmpfs on every sweep. Caught by GPT 5.6 review of PR #8559.
+        """
+        self._fence(monkeypatch, tmp_path)
+        monkeypatch.setattr("kiro_crew.sandbox._LEGACY_PILE_THRESHOLD", 4)
+        strays = [self._legacy_dir(tmp_path, f"tmpstray00{i}") for i in range(3)]
+
+        assert _cleanup_legacy_mount_source_residue() == 0
+        for stray in strays:
+            assert stray.exists(), stray
+        # Retired: a later pass is a no-op even once more candidates appear.
+        self._legacy_dir(tmp_path, "tmpstray003")
+        assert _cleanup_legacy_mount_source_residue() == 0
+
+    def test_at_the_pile_threshold_the_buffered_candidates_are_reclaimed_too(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Candidates seen BEFORE the threshold is reached are not stranded."""
+        self._fence(monkeypatch, tmp_path)
+        monkeypatch.setattr("kiro_crew.sandbox._LEGACY_PILE_THRESHOLD", 4)
+        pile = [self._legacy_dir(tmp_path, f"tmppile000{i}") for i in range(6)]
+
+        assert _cleanup_legacy_mount_source_residue() == 6
+        for entry in pile:
+            assert not entry.exists(), entry
+
+    @pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX-only root chain")
+    def test_legacy_roots_exclude_dev_shm(self, sandbox_sweep_original):
+        """``/dev/shm`` is host-wide and where other programs' ``tempfile``
+        scratch legitimately lives; the unkeyed pass must never walk it, even
+        though the launcher falls back to it for staging."""
+        real = sandbox_sweep_original("_launcher_tmpfs_roots")
+        assert real() == [f"/run/user/{os.getuid()}"]
+
+    def test_wired_into_the_periodic_entry_point(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """It must run from the same call the gateway already makes, or a
+        just-updated host stays broken until someone finds it by hand."""
+        self._fence(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            "kiro_crew.sandbox._mount_source_candidate_roots", lambda: [str(tmp_path)]
+        )
+        legacy = self._legacy_dir(tmp_path)
+
+        removed = cleanup_stale_sandbox_profiles(legacy_dir=str(tmp_path / "absent"))
+
+        assert removed >= 1
+        assert not legacy.exists()
+
+    def test_reclaim_starts_at_boot_without_holding_the_loop(self):
+        """The cleanup loop must START the reclaim, and must not WAIT on it.
+
+        Two failures this pins apart. Deferring the reclaim to the first interval
+        leaves a just-updated gateway unable to spawn anything for 5-10 minutes
+        with the fix already installed. Awaiting it instead queues every other
+        sweep in that loop behind a pass that a pathological pile or a stalled
+        filesystem can make arbitrarily slow -- so the reclaim is dispatched as
+        its own task, before the tick loop is entered.
+
+        Asserted structurally: the ORDER and the non-await are the contract, and
+        both are one edit away from silently regressing.
+        """
+        import kiro_crew.session_cleanup as cleanup_mod
+
+        tree = ast.parse(Path(cleanup_mod.__file__).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.AsyncFunctionDef) or node.name != "_cleanup_loop":
+                continue
+            body = [ast.dump(stmt) for stmt in node.body]
+            ticks = [i for i, dumped in enumerate(body) if "_run_cleanup_ticks" in dumped]
+            if not ticks:
+                continue  # the Protocol stub (`async def _cleanup_loop(self) -> None: ...`)
+            dispatch = [i for i, dumped in enumerate(body) if "_sweep_sandbox_artifacts" in dumped]
+            assert dispatch, "_cleanup_loop does not start the sandbox reclaim"
+            assert min(dispatch) < min(ticks), "the reclaim must be dispatched before the ticks"
+            assert "create_task" in body[min(dispatch)], (
+                "the reclaim must be dispatched as a task, not awaited inline"
+            )
+            return
+        raise AssertionError("no _cleanup_loop implementation found in session_cleanup")
+
+
+class TestSweepTimeBudget:
+    """One pass is bounded; the remainder is the next pass's work.
+
+    The sweep shares the maintenance executor with other housekeeping, so a
+    multi-million-entry backlog must not hold a worker for a minute. Reclaim is
+    decided per entry, so a truncated pass is progress rather than an
+    inconsistent state.
+    """
+
+    def _spent_budget(self) -> pytest.MonkeyPatch:
+        """A SCOPED patcher for the budget knobs, deliberately not the test's own.
+
+        ``monkeypatch.undo()`` would also revert the autouse host-isolation floor
+        — including the ``KIROCREW_HOME`` pin — and this sweep then stamps its
+        one-shot marker into the operator's REAL data home. Caught in review of
+        this very test. Every knob here is therefore undone through its own
+        context, never the shared fixture.
+
+        Budget already spent, checked every SECOND entry: the check runs before
+        the entry it counts, so checking on the first would stop a pass having
+        done nothing, and a pass that can never progress is a different bug.
+        """
+        budget = pytest.MonkeyPatch()
+        budget.setattr("kiro_crew.sandbox._SWEEP_TIME_BUDGET_SECONDS", -1.0)
+        budget.setattr("kiro_crew.sandbox._SWEEP_BUDGET_CHECK_EVERY", 2)
+        return budget
+
+    def test_keyed_pass_stops_at_the_budget_and_resumes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ):
+        _pin(monkeypatch, set())
+        for index in range(4):
+            _make_file(tmp_path, f"kirocrew_sb_{_DEAD_PID}_file{index:02d}")
+
+        budget = self._spent_budget()
+        try:
+            with caplog.at_level(logging.INFO, logger="kiro_crew.sandbox"):
+                first = _cleanup_stale_sandbox_mount_sources(roots=[str(tmp_path)])
+        finally:
+            budget.undo()
+
+        assert first == 1
+        assert any("paused at the" in r.getMessage() for r in caplog.records)
+        assert len(list(tmp_path.iterdir())) == 3
+
+        # Budget restored: the remainder is reclaimed, nothing is stranded.
+        assert _cleanup_stale_sandbox_mount_sources(roots=[str(tmp_path)]) == 3
+        assert not list(tmp_path.iterdir())
+
+    def test_truncated_legacy_pass_does_not_stamp_the_one_shot_marker(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Stamping a partial pass would retire the rest of the residue unswept."""
+        monkeypatch.setattr("kiro_crew.sandbox._launcher_tmpfs_roots", lambda: [str(tmp_path)])
+        monkeypatch.setattr(
+            "kiro_crew.sandbox._bound_source_basenames",
+            lambda proc_root="/proc": (set(), True),
+        )
+        monkeypatch.setattr("kiro_crew.sandbox._LEGACY_PILE_THRESHOLD", 1)
+        stale = time.time() - _MOUNT_SOURCE_MAX_AGE_SECONDS - 100
+        for name in ("tmpaaaaaaaa", "tmpbbbbbbbb", "tmpcccccccc"):
+            path = tmp_path / name
+            path.mkdir(mode=0o700)
+            os.chmod(path, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions  # noqa: E501  # fmt: skip
+            os.utime(path, (stale, stale))
+
+        budget = self._spent_budget()
+        try:
+            assert _cleanup_legacy_mount_source_residue() == 1
+        finally:
+            budget.undo()
+        assert len(list(tmp_path.iterdir())) == 2
+
+        # The marker was NOT stamped, so the next pass finishes the residue.
+        assert _cleanup_legacy_mount_source_residue() == 2
+        assert not list(tmp_path.iterdir())
+
+
 class TestHeldBackDiagnostic:
     """Retention must be distinguishable from reclamation in the log.
 
@@ -875,6 +1315,7 @@ class TestHeldBackDiagnostic:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ):
         _pin(monkeypatch, set(), complete=False)
+        _staging_group(monkeypatch, alive=True)
         _make_dir(tmp_path, f"kirocrew_sb_{_DEAD_PID}_held01")
 
         with caplog.at_level(logging.INFO, logger="kiro_crew.sandbox"):
