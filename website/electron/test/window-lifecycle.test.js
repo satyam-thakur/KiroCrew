@@ -322,3 +322,23 @@ describe("window lifecycle source contracts", () => {
     }
   });
 });
+
+describe("main window frame-load diagnostics", () => {
+  it("journals frame loads on the dashboard webContents", () => {
+    const createWindow = SOURCE.match(/function createWindow\(\) \{([\s\S]*?)\n  \}\n/);
+    assert.ok(createWindow, "createWindow missing");
+    assert.match(
+      createWindow[1],
+      /attachFrameLoadLogging\(\s*mainWindow\.webContents,\s*glog\s*\)/,
+      "a crew pane that never navigates must leave evidence in gateway-launch.log",
+    );
+  });
+
+  it("writes those lines through the launch log, not console only", () => {
+    assert.match(
+      SOURCE,
+      /require\("\.\/frame-load-log"\)/,
+      "frame diagnostics must come from the shared, unit-tested module",
+    );
+  });
+});
