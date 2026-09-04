@@ -10125,6 +10125,269 @@ class TestIdentityAuthStoreFence:
         assert (store is None) == (control is None)
 
 
+class TestSubstitutionBodiesTrackQuoting:
+    """A ``)`` the shell reads as a literal must not end an extracted body (#8150).
+
+    ``_substitution_bodies`` is the shared answer to "what text does this command
+    run as a shell", so a body that stops early is not one pass's problem: every
+    consumer inherits the blindness. It found the closer by counting parentheses
+    with no quoting state, so ``$(printf ')' ; find <fenced> -exec cat {} +)`` came
+    back as ``printf '`` and the traversal behind the decoy was invisible.
+
+    Both directions are asserted, because only one of them is the bug report. The
+    scan may not stop early (the decoys below), and it may not start seeing bodies
+    where the shell sees none, nor lose the ones it already saw -- a scanner made
+    more forgiving is how a check loses its ability to refuse.
+    """
+
+    FENCE_TRAVERSAL = "find ~/.kiro/crew -name credentials -exec cat {} +"
+
+    # ── the decoy spellings: each hides the closer a different way ──
+
+    @pytest.mark.parametrize(
+        ("decoy", "label"),
+        (
+            ("printf ')' ; ", "single-quoted paren"),
+            ('echo ")" && ', "double-quoted paren"),
+            ("printf \\) ; ", "backslash-escaped paren"),
+            ('echo "don\'t) stop" ; ', "paren behind an apostrophe inside double quotes"),
+            ("echo 'say \") hi' ; ", "paren behind a double quote inside single quotes"),
+        ),
+    )
+    def test_a_quoted_closer_does_not_truncate_the_body(self, decoy: str, label: str) -> None:
+        """The body must reach the traversal, not stop at the decoy."""
+        command = f'echo "$({decoy}{self.FENCE_TRAVERSAL})"'
+        bodies = security._substitution_bodies(command)
+        assert bodies == [f"{decoy}{self.FENCE_TRAVERSAL}"], label
+
+    @pytest.mark.parametrize(
+        "opener",
+        ("$(", "<(", ">("),
+    )
+    def test_process_substitution_shares_the_walk(self, opener: str) -> None:
+        """``<( )`` and ``>( )`` run their body as a command too, so one scan serves all."""
+        command = f"cat {opener}printf ')' ; {self.FENCE_TRAVERSAL})"
+        assert security._substitution_bodies(command) == [f"printf ')' ; {self.FENCE_TRAVERSAL}"]
+
+    @pytest.mark.parametrize(
+        "decoy",
+        ("printf '`' ; ", "printf \\` ; "),
+    )
+    def test_a_quoted_backtick_does_not_truncate_either(self, decoy: str) -> None:
+        """The closing BACKTICK is hidden by the same three devices as ``)``."""
+        command = f'echo "`{decoy}{self.FENCE_TRAVERSAL}`"'
+        assert security._substitution_bodies(command) == [f"{decoy}{self.FENCE_TRAVERSAL}"]
+
+    # ── the trap: an apostrophe is not an unterminated quote ──
+
+    def test_an_apostrophe_inside_double_quotes_is_a_literal(self) -> None:
+        """A single quote inside double quotes opens nothing.
+
+        Reading it as an opener would leave the scan "inside a quote" for the rest
+        of the line, swallowing the real closer -- so a legitimate body would come
+        back over-long and the false-positive surface the issue warns about would
+        be exactly what the fix introduced.
+        """
+        assert security._substitution_bodies('echo "$(echo "it\'s fine")"') == ['echo "it\'s fine"']
+        assert security.is_sensitive_bash_command('echo "$(echo "it\'s fine")"') is None
+
+    def test_a_quoted_paren_under_nesting_keeps_the_outer_body_whole(self) -> None:
+        """Ignoring parens inside double quotes is what makes this balance.
+
+        A nested ``$( )`` contributes one open and one close, so ignoring both
+        inside the quoted region leaves the outer closer where the shell puts it.
+        """
+        assert security._substitution_bodies('echo "$(echo "$(printf \')\')")"') == [
+            "echo \"$(printf ')')\""
+        ]
+
+    def test_a_quoted_open_paren_no_longer_swallows_a_later_command(self) -> None:
+        """``(`` was counted inside quotes too, so a body ran past its own closer."""
+        command = "echo \"$(grep '(foo' x)\" ; kill $(pgrep -f kirocrew)"
+        assert security._substitution_bodies(command) == [
+            "grep '(foo' x",
+            "pgrep -f kirocrew",
+        ]
+
+    # ── regions whose contents are not grammar: heredoc, ${ }, $(( )) ──
+
+    @pytest.mark.parametrize(
+        ("prefix", "label"),
+        (
+            ('cat <<EOF\n")\nEOF\n', "heredoc, bare marker"),
+            ('cat <<"EOF"\n")\nEOF\n', "heredoc, double-quoted marker"),
+            ("cat <<'EOF'\n\")\nEOF\n", "heredoc, single-quoted marker"),
+            ('cat <<\\EOF\n")\nEOF\n', "heredoc, backslashed marker"),
+            ('cat <<-EOF\n\t")\n\tEOF\n', "heredoc, dash form with tab-indented terminator"),
+            ("cat <<A\n)\nA\ncat <<B\n)\nB\n", "two heredocs in one body"),
+            ('echo $(cat <<EOF\n")\nEOF\n) ; ', "heredoc inside a nested substitution"),
+            ("echo ${x:-)} ; ", "paren inside a ${ } default"),
+            ("echo ${x:-${y:-)}} ; ", "paren inside a nested ${ } default"),
+            ("echo $(( 1 << 2 )) ; ", "left shift, which is not a heredoc marker"),
+            ("echo $(( (1+2) << 2 )) ; ", "left shift under arithmetic nesting"),
+        ),
+    )
+    def test_a_region_the_shell_does_not_read_as_grammar(self, prefix: str, label: str) -> None:
+        """Each of these was measured EXECUTING the traversal in real bash.
+
+        A heredoc body is data until its terminator line, a ``${ }`` expansion and a
+        ``$(( ))`` arithmetic expansion hold characters the shell does not act on
+        there -- so a ``)`` in any of them closes nothing. Reading one as grammar is
+        the same truncation as the quoted paren wearing different clothes, and the
+        consequence was identical: the decoy ALLOWED, the control DENIED.
+
+        The arithmetic rows carry no decoy paren at all; they are here because
+        stepping over ``$(( ))`` is what keeps its ``<<`` a left shift rather than a
+        heredoc marker that swallows the rest of the body.
+        """
+        command = f'echo "$({prefix}{self.FENCE_TRAVERSAL})"'
+        assert security._substitution_bodies(command) == [f"{prefix}{self.FENCE_TRAVERSAL}"], label
+        assert security.is_sensitive_bash_command(command), label
+
+    def test_a_heredoc_with_no_terminator_takes_the_rest_of_the_text(self) -> None:
+        """Unterminated is the conservative direction, same as an unbalanced paren."""
+        command = f'echo "$(cat <<EOF\n")\n{self.FENCE_TRAVERSAL})"'
+        assert security._substitution_bodies(command) == [
+            f'cat <<EOF\n")\n{self.FENCE_TRAVERSAL})"'
+        ]
+        assert security.is_sensitive_bash_command(command)
+
+    def test_a_here_string_is_not_a_heredoc(self) -> None:
+        """``<<<`` takes an ordinary word, so the quoting rules already cover it and
+        it must not be read as a marker naming a terminator line."""
+        command = f'echo "$(cat <<< "x)" ; {self.FENCE_TRAVERSAL})"'
+        assert security._substitution_bodies(command) == [f'cat <<< "x)" ; {self.FENCE_TRAVERSAL}']
+        assert security.is_sensitive_bash_command(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            # a heredoc, an expansion and arithmetic that name nothing fenced
+            'echo "$(cat <<EOF\nhello\nEOF\necho done)"',
+            'echo "$(echo ${x:-fallback} ; echo done)"',
+            'echo "$(echo $(( 1 << 2 )) ; echo done)"',
+            'echo "$(echo $(( (1+2) << 2 )) ; echo done)"',
+            'echo "$(echo ${x:-${y:-a}} ; echo done)"',
+            "echo \"$(grep '<<' Makefile)\"",
+        ),
+    )
+    def test_the_new_regions_do_not_over_block(self, command: str) -> None:
+        """The scan gained state, not permission to refuse more."""
+        assert security.is_sensitive_bash_command(command) is None, command
+
+    # ── the other direction: bodies already seen must still be seen ──
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            "sh -c 'echo $(kirocrew token)'",
+            'sh -c "echo $(kirocrew token)"',
+            "cat <(kirocrew token)",
+            "echo `kirocrew token`",
+        ),
+    )
+    def test_the_opener_stays_quote_blind(self, command: str) -> None:
+        """Only the CLOSER became quote-aware, and deliberately so.
+
+        A quote-aware opener would read the payload of ``sh -c '<substitution>'``
+        as inert text and hand consumers nothing -- less to inspect, which is the
+        wrong direction for a check that exists to see more.
+        """
+        assert security._substitution_bodies(command) == ["kirocrew token"]
+
+    def test_an_unterminated_quote_falls_back_to_the_rest_of_the_text(self) -> None:
+        """Same conservative fallback an unbalanced paren already had: too much
+        text is inspected too hard, while too little is the bug being fixed."""
+        command = "echo \"$(printf 'oops ; " + self.FENCE_TRAVERSAL + ')"'
+        assert security._substitution_bodies(command) == [
+            "printf 'oops ; " + self.FENCE_TRAVERSAL + ')"'
+        ]
+
+    @pytest.mark.parametrize(
+        "text",
+        ("", "$(", "`", "$('", 'echo "$(', "<(", "$(\\", "'", '"', "$(a\\"),
+    )
+    def test_degenerate_input_does_not_raise(self, text: str) -> None:
+        """A truncated escape at the very end must not index past the string."""
+        assert isinstance(security._substitution_bodies(text), list)
+
+    # ── the consumers ──
+
+    @pytest.mark.parametrize(
+        "decoy",
+        ("printf ')' ; ", 'echo ")" && ', "printf \\) ; ", "printf '`' ; "),
+    )
+    def test_the_traversal_pass_now_agrees_with_its_own_control(self, decoy: str) -> None:
+        """The load-bearing consumer.
+
+        ``~/.kiro/crew`` is the root that isolates this helper: no token holds a
+        complete fenced path, so the traversal pass is the only thing that can say
+        no, and before the fix these three were ALLOWED while the identical command
+        without the decoy was DENIED. Measured on the public gate, not on the pass,
+        so the assertion is about what a caller actually gets.
+        """
+        control = f'echo "$({self.FENCE_TRAVERSAL})"'
+        decoyed = f'echo "$({decoy}{self.FENCE_TRAVERSAL})"'
+        assert security.is_sensitive_bash_command(control), control
+        assert security.is_sensitive_bash_command(decoyed), decoyed
+
+    @pytest.mark.parametrize(
+        "decoy",
+        ("printf '`' ; ", "printf \\` ; "),
+    )
+    def test_the_traversal_pass_sees_past_a_hidden_backtick_too(self, decoy: str) -> None:
+        """Same consumer, backtick closer: ALLOWED before the fix, DENIED after."""
+        control = f'echo "`{self.FENCE_TRAVERSAL}`"'
+        decoyed = f'echo "`{decoy}{self.FENCE_TRAVERSAL}`"'
+        assert security.is_sensitive_bash_command(control), control
+        assert security.is_sensitive_bash_command(decoyed), decoyed
+
+    def test_the_mint_verb_pass_sees_past_the_decoy(self) -> None:
+        """``T=$(printf ')' ; printf <verb>); <name> $T`` hid the verb behind it."""
+        tokens = "t=$(printf ')' ; printf token); kirocrew $t".split()
+        assert any(security._mint_verb_in_substitution(tokens, i) for i in range(len(tokens)))
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            "kill $(pgrep -f kirocrew)",
+            "kill `pgrep -f kirocrew`",
+            "p=$(pgrep -f kirocrew); kill $p",
+            "kill $(pgrep -f kiro${x:-crew})",
+        ),
+    )
+    def test_self_kill_detection_is_unchanged(self, command: str) -> None:
+        """The scoped-argv consumer keeps every spelling it already caught.
+
+        Its own decoy is NOT fixed here: the argv window is bounded by
+        ``_substitution_depth_delta``, which counts parens on tokens
+        ``normalize_shell_command`` has already stripped the quotes from, so the
+        quoting is gone before that counter runs. That is a different function and
+        a different fix; what this pins is that the body arriving whole costs the
+        pass nothing.
+        """
+        assert security._is_self_kill(command) is True, command
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            # deliberate scoping: the name is an operand of a DIFFERENT command
+            "kill 8123 && cp /tmp/kirocrew.json ~/",
+            "kill 123; echo $(cat /tmp/kirocrew)",
+            # ordinary substitutions, and a quoted paren that names nothing fenced
+            "echo \"$(grep '(foo)' x)\"",
+            'echo "$(date)"',
+            "echo $(printf 'hello')",
+            "grep -r TODO $(git ls-files)",
+            # a traversal outside the fence stays allowed, decoy or not
+            "find ~/src -name README -exec cat {} +",
+            "echo \"$(printf ')' ; find ~/src -name README -exec cat {} +)\"",
+        ),
+    )
+    def test_benign_commands_are_still_allowed(self, command: str) -> None:
+        assert security.is_sensitive_bash_command(command) is None, command
+
+
 class TestFindTraversalReachesFence:
     """``find`` factors a path into a root and a name pattern, so neither token names it.
 

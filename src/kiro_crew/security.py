@@ -4389,6 +4389,11 @@ def _substitution_bodies(text: str) -> "list[str]":
     first does not truncate the outer body; backticks are taken pairwise.  Only
     the BODY is returned -- a bare ``kill`` must not be attributed a name that
     merely appears in a LATER, unrelated command of the same line.
+
+    Finding the closer is `_substitution_closer`'s job, and it is QUOTE-AWARE: a
+    ``)`` the shell reads as a literal character does not end the body.  Without
+    that, ``$(printf ')' ; find <fenced> -exec cat {} +)`` yielded ``printf '``
+    and every consumer of this helper was blind to the rest of the substitution.
     """
     bodies: list[str] = []
     i = 0
@@ -4396,36 +4401,215 @@ def _substitution_bodies(text: str) -> "list[str]":
         # PROCESS substitutions run their body as a command just as a command
         # substitution does -- ``cat <(kirocrew token)`` executes the inner command and
         # feeds its output through a pipe.  Same paren-nesting walk.
-        if text.startswith("<(", i) or text.startswith(">(", i):
-            depth = 1
-            j = i + 2
-            while j < len(text) and depth:
-                if text[j] == "(":
-                    depth += 1
-                elif text[j] == ")":
-                    depth -= 1
-                j += 1
-            bodies.append(text[i + 2 : j - 1 if depth == 0 else len(text)])
-            i = j
-            continue
-        if text.startswith("$(", i):
-            depth = 1
-            j = i + 2
-            while j < len(text) and depth:
-                if text[j] == "(":
-                    depth += 1
-                elif text[j] == ")":
-                    depth -= 1
-                j += 1
-            bodies.append(text[i + 2 : j - 1 if depth == 0 else len(text)])
-            i = j
+        if text.startswith("<(", i) or text.startswith(">(", i) or text.startswith("$(", i):
+            end, closed = _substitution_closer(text, i + 2, ")")
+            bodies.append(text[i + 2 : end - 1 if closed else len(text)])
+            i = end
         elif text[i] == "`":
-            j = text.find("`", i + 1)
-            bodies.append(text[i + 1 : j if j != -1 else len(text)])
-            i = len(text) if j == -1 else j + 1
+            end, closed = _substitution_closer(text, i + 1, "`")
+            bodies.append(text[i + 1 : end - 1 if closed else len(text)])
+            i = end
         else:
             i += 1
     return bodies
+
+
+def _matching_close(text: str, start: int, opener: str, closer: str) -> "int | None":
+    """Index just past the *closer* matching the *opener* at *start*, or None.
+
+    Used to step OVER a region whose contents this scan must not read as shell
+    grammar: a ``${ }`` expansion and a ``$(( ))`` arithmetic expansion both hold
+    characters the shell does not act on there -- a ``)`` in ``${x:-)}`` closes
+    nothing, and the ``<<`` in ``$(( 1 << 2 ))`` is a left shift and not a heredoc.
+    """
+    depth = 0
+    j = start
+    while j < len(text):
+        if text[j] == opener:
+            depth += 1
+        elif text[j] == closer:
+            depth -= 1
+            if depth == 0:
+                return j + 1
+        j += 1
+    return None
+
+
+# A heredoc marker ends at whitespace or at any operator that could follow it.
+_HEREDOC_MARKER_STOP = frozenset(" \t\n;)|&<>")
+
+
+def _heredoc_body_end(text: str, start: int, strip_tabs: bool) -> "int | None":
+    """Index just past the terminator LINE of the heredoc whose marker is at *start*.
+
+    A heredoc body is data, not grammar: every character until the terminator line
+    is text the shell hands to the command, so a ``)`` or a lone ``"`` in there is
+    inert.  Reading it as grammar is a truncation with the same consequence as the
+    quoted paren -- confirmed executable in bash, where ``$(cat <<EOF``/``")``/
+    ``EOF``/``find <fenced> -exec cat {} +)`` runs the traversal and prints the
+    file while the extracted body stopped at ``cat <<EOF\\n")``.
+
+    The marker may be quoted or backslashed (``<<"EOF"``, ``<<'EOF'``, ``<<\\EOF``);
+    the terminator line carries its UNQUOTED value, so the quoting is stripped here.
+    ``<<-`` permits leading TABS on the terminator line and plain ``<<`` does not,
+    which is *strip_tabs*, and the distinction is kept rather than always stripping:
+    finding a terminator EARLIER than the shell does would resume the scan inside
+    what is still heredoc data and could close on a ``)`` the shell never reads.
+
+    None when there is no terminator line, or no marker at all -- and the caller
+    treats that as "no closer found" and takes the rest of the text, since a body
+    inspected too far is safe and one cut short is the defect.
+    """
+    j = start
+    while j < len(text) and text[j] in " \t":
+        j += 1
+    marker: list[str] = []
+    while j < len(text) and text[j] not in _HEREDOC_MARKER_STOP:
+        ch = text[j]
+        if ch == "\\":
+            if j + 1 < len(text):
+                marker.append(text[j + 1])
+            j += 2
+            continue
+        if ch in "'\"":
+            close = text.find(ch, j + 1)
+            if close == -1:
+                return None
+            marker.append(text[j + 1 : close])
+            j = close + 1
+            continue
+        marker.append(ch)
+        j += 1
+    word = "".join(marker)
+    if not word:
+        return None
+    first = text.find("\n", j)
+    if first == -1:
+        return None
+    pos = first + 1
+    while pos <= len(text):
+        end = text.find("\n", pos)
+        line = text[pos:] if end == -1 else text[pos:end]
+        candidate = line.lstrip("\t") if strip_tabs else line
+        if candidate.rstrip("\r") == word:
+            return len(text) if end == -1 else end + 1
+        if end == -1:
+            return None
+        pos = end + 1
+    return None
+
+
+def _substitution_closer(text: str, start: int, closer: str) -> "tuple[int, bool]":
+    """``(index just past the closer, whether one was found)`` for a body at *start*.
+
+    Counting parentheses alone answers "where does this substitution end?" with a
+    position the shell does not agree with, because the shell decides that from
+    QUOTING state and the scan had none.  ``$(printf ')' ; find <fenced> -exec cat
+    {} +)`` closes at the quoted paren, so the body came back as ``printf '`` and
+    the traversal after the decoy was never seen -- by ANY of this helper's
+    consumers, since they all read bodies through it.  Backslash and double quotes
+    hide a ``)`` the same way, and the closing BACKTICK is hidden by the same three
+    devices, so one walk serves both closers.
+
+    The rules are the shell's own:
+
+    * inside single quotes nothing is special -- not a backslash, not a double
+      quote, not a paren -- until the next ``'``;
+    * inside double quotes a backslash hides the next character and ``"`` ends the
+      region; a bare paren is a literal, and a nested ``$( )`` contributes a
+      balanced pair, so ignoring parens here is what makes ``$(echo "$(printf
+      ')')")`` come back whole rather than cut at the inner quoted paren;
+    * outside quotes a backslash hides the next character, a quote opens a region,
+      and only there does ``(`` nest and ``)`` close.
+
+    A single quote INSIDE double quotes must not open a region, or the apostrophe
+    in ``$(echo "it's fine")`` would swallow the real closer -- which is why this
+    tracks one quote character rather than two booleans.
+
+    Three regions are stepped over WHOLE, because their contents are not grammar
+    the shell acts on at that point and reading them as such is the same truncation
+    wearing different clothes: a heredoc body (data until its terminator line), a
+    ``${ }`` expansion, and a ``$(( ))`` arithmetic expansion.  Each was measured
+    executable in bash -- ``${x:-)}`` and a heredoc holding ``")`` each hid a
+    traversal that ran.  Stepping over arithmetic also keeps its ``<<`` a left
+    shift rather than a heredoc marker.
+
+    Nothing here decides where a substitution BEGINS: the caller still opens one on
+    every ``$(`` / ``<(`` / ``>(`` / backtick it sees, quoted or not.  Making the
+    opener quote-aware too would DROP bodies -- the payload of ``sh -c 'echo
+    $(kirocrew token)'`` is inside single quotes -- and this scanner exists to hand
+    consumers more text to inspect, never less.
+
+    An unterminated quote, heredoc or expansion leaves *closed* False and the caller
+    takes the rest of the text as the body, which is the same conservative fallback
+    an unbalanced paren already had: a body that reaches too far is inspected too
+    much, while one that stops early is the bug above.
+    """
+    depth = 1
+    quote = ""
+    j = start
+    while j < len(text):
+        ch = text[j]
+        if quote == "'":
+            if ch == "'":
+                quote = ""
+            j += 1
+            continue
+        if ch == "\\":
+            j += 2
+            continue
+        if quote == '"':
+            if ch == '"':
+                quote = ""
+            j += 1
+            continue
+        if ch in "'\"":
+            quote = ch
+            j += 1
+            continue
+        # ── regions whose contents are not grammar here ──
+        if ch == "$" and text.startswith("$((", j):
+            # From the FIRST paren, so both closers are consumed: starting a paren
+            # deeper returns past ``)`` number one and leaves number two to close
+            # the substitution this scan is measuring.
+            end = _matching_close(text, j + 1, "(", ")")
+            if end is None:
+                return len(text), False
+            j = end
+            continue
+        if ch == "$" and text.startswith("${", j):
+            end = _matching_close(text, j + 1, "{", "}")
+            if end is None:
+                return len(text), False
+            j = end
+            continue
+        # A heredoc is EXACTLY two ``<``. Deciding that from a two-character prefix
+        # test reads the second ``<`` of a here-string as a heredoc of its own -- in
+        # ``cat <<< "x)"`` the marker then parsed as ``x)`` -- so measure the whole
+        # run: ``<`` is a redirect, ``<<`` a heredoc, ``<<<`` a here-string whose
+        # operand is an ordinary word the quoting rules above already cover.
+        if ch == "<":
+            run = len(text[j:]) - len(text[j:].lstrip("<"))
+            if run != 2:
+                j += run
+                continue
+            dash = text.startswith("-", j + 2)
+            end = _heredoc_body_end(text, j + (3 if dash else 2), dash)
+            if end is None:
+                return len(text), False
+            j = end
+            continue
+        if closer == ")":
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return j + 1, True
+        elif ch == closer:
+            return j + 1, True
+        j += 1
+    return len(text), False
 
 
 def _redirect_glue_point(word: str) -> "int | None":
