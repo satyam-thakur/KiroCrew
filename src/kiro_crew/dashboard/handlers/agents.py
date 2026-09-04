@@ -2563,6 +2563,178 @@ async def api_capability_mcp_registry(request: web.Request) -> web.Response:
 # ── KiroCrew Agent CRUD API ──
 
 
+def _roster_mask(value: object) -> str:
+    """Render ONE agent-record value for a roster row, masking what cannot be shown.
+
+    Every record value is agent- or package-writable: an agent can edit
+    ``config.json`` directly, and ``_do_agents_sync`` copies ``description``
+    straight off a discovered agent spec, so a third-party package controls that
+    string. A value the redactors would alter -- credential- or
+    exfiltration-URL-shaped text -- is therefore replaced WHOLESALE by
+    ``_SENSITIVE_MASK``, the sentinel ``_masked_config_dict`` already uses for
+    the same job on ``GET /api/config/kirocrew``. A non-string (the loader lets
+    an object through five declared-``str`` fields) is masked too: it is not
+    renderable, so there is nothing to show. Benign content is byte-identical.
+
+    **A fixed sentinel rather than redacting in place, and that is the whole
+    design.** An in-place scrub makes the browser's view a FUNCTION of the
+    stored value, so the write-side rule that keeps a read-modify-write from
+    persisting that view (``_carries_mask``) has to recognise it by
+    recomputing the transform -- which breaks in two ways a sentinel does not:
+
+    * **Redaction-chain drift.** #8465 wraps this same response in
+      ``redact_record_strings``, whose order differs from ``_redact_external``'s.
+      A recomputed-equality rule would stop matching and silently persist the
+      redacted text; an exact sentinel survives, because scrubbing
+      ``_SENSITIVE_MASK`` leaves it unchanged.
+    * **Stale-view skew.** If the stored value changes between the GET and the
+      PUT (an agent editing ``config.json``, a second dashboard tab), a
+      recomputed rule compares the old view against the NEW value, fails to
+      match, and writes ``[REDACTED ...]`` text into the config as though the
+      operator had typed it. The sentinel does not depend on the stored value at
+      all, so this cannot happen.
+
+    Named cost: a value containing one credential-shaped token is masked
+    entirely, so the owner loses the benign remainder of that string rather than
+    seeing it partially redacted. That is the same trade ``_masked_config_dict``
+    already makes, and it is the price of a view that cannot be mistaken for
+    content.
+    """
+    # Function-local for the reason recorded at the ``_validate_role_model``
+    # import below: ``handlers.core`` resolves ``_get_config_lock`` from THIS
+    # module, so a module-level import here would close the cycle.
+    from kiro_crew.dashboard.handlers.core import _SENSITIVE_MASK
+
+    if not isinstance(value, str):
+        return _SENSITIVE_MASK
+    return value if _redact_external(value) == value else _SENSITIVE_MASK
+
+
+def _carries_mask(incoming: object) -> bool:
+    """True when *incoming* still CARRIES the mask, so it is not real content.
+
+    The write-side half of ``_roster_mask``. A client that read a roster row and
+    echoed it back sends the mask; persisting it would destroy the operator's
+    stored value. Such a field is treated as UNCHANGED instead.
+
+    **Containment, not equality.** An exact-match rule closes only the
+    echo-it-back case. The editor renders the mask into a text input, so an
+    operator who APPENDS to it submits ``"<mask> and also X"`` -- not equal to the
+    sentinel, so an equality rule would persist the redaction glyphs plus the
+    addition, replacing the stored original. Any string still containing the
+    sentinel is therefore refused as content.
+
+    Consequence, stated because it is a real limitation and not a free win: a
+    genuine replacement must OMIT the sentinel entirely -- clear the field, then
+    type the new value. An edit that keeps the mask and adds to it is dropped
+    rather than half-applied. That is lossy in the operator's INTENT, but it never
+    destroys what is stored, and the alternative writes redaction glyphs into
+    ``config.json`` over the real value.
+
+    This is the remedy ``_masked_config_dict``'s docstring prescribes -- "MUST
+    treat ``_SENSITIVE_MASK`` as 'unchanged' and keep the stored value" -- read
+    the strict way. Because the comparison is against a FIXED sentinel and never
+    against a recomputation of the stored value, it is immune to which redaction
+    chain produced the view and to the stored value having changed since the read.
+
+    Accepted residual, identical in kind to the config endpoint's: an operator
+    cannot store a value containing the mask string. It is eight U+2022 bullets.
+    """
+    from kiro_crew.dashboard.handlers.core import _SENSITIVE_MASK
+
+    return isinstance(incoming, str) and _SENSITIVE_MASK in incoming
+
+
+def _agent_roster_row(
+    name: str, scope: str, agent_cfg: KiroCrewAgentConfig, *, redact: bool
+) -> dict[str, str]:
+    """Serialize ONE ``GET /api/agents`` roster row.
+
+    **Key half.** Explicit allowlist -- never a ``dataclasses.asdict`` spread,
+    mirroring the rule ``handlers/members.py`` already documents for
+    ``GET /api/members``. The response is a network-boundary contract, and a
+    spread makes that contract "every field ``KiroCrewAgentConfig`` has now, plus
+    every field anyone adds later", automatically -- so a field added by someone
+    who never looked at this endpoint (internal bookkeeping, a filesystem path, a
+    capability hint, a credential-shaped one) ships to the browser by omission.
+    Naming each field inverts the default: nothing leaves unless it is added here
+    deliberately (#8454). Both row sources go through this one function, so the
+    ``cfg.agents`` rows and the project-scope rows cannot drift into different
+    key sets.
+
+    **Value half.** Every record value goes through ``_roster_mask``, for every
+    caller, uniformly -- see there for why they are all untrusted and why the
+    mask is a fixed sentinel. ``_carries_mask`` is its write-side half in
+    ``api_kirocrew_agent_update``; neither is correct alone, and an end-to-end
+    test does the GET then the PUT to prove the pair.
+
+    Uniform rather than per-field on purpose: an earlier revision exempted the
+    fields the agents page happens to write back today, which encoded a claim
+    about the CLIENT that this side could not enforce -- and it was already
+    wrong, because ``api_kirocrew_agent_update`` accepts ``description`` and
+    ``source`` too.
+
+    ``name`` is the single exception, and only for the owner: it is the row's
+    IDENTITY, addressing ``/api/agents/{name}`` for edit and delete and keying
+    the usage sort, and it travels in the URL rather than the body so the
+    write-side rule cannot protect it. Masking it would make the row
+    unaddressable. An ``app`` token cannot reach those owner-gated routes, so the
+    exemption buys it nothing and ``name`` is masked there -- crew creation
+    enforces only that a name is non-empty (the shared ``_AGENT_NAME_RE`` grammar
+    guards ``kiro_agent``, not ``name``), so it is agent-writable text like any
+    other. Named cost: an app that feeds a roster name to another route sees the
+    mask, which happens only for a name containing credential- or URL-shaped
+    text.
+
+    ``scope`` is never masked: it is a literal written here, not record content.
+    The annotation is ``dict[str, str]`` and is now true rather than aspirational
+    -- ``_roster_mask`` returns a ``str`` for every input, including the
+    non-strings the loader lets through.
+
+    Excluded on purpose, each verified to have NO consumer in ``website/src``:
+    ``watchdog_tool_stall_suspect_secs`` and ``watchdog_tool_stall_hard_cap_secs``
+    (per-agent watchdog windows -- backend scheduling knobs the roster does not
+    render) and ``telegram_account`` (deprecated and inert, and the one record
+    field naming an external messaging binding). Adding any of them back is a
+    one-line change plus the pinned key set.
+    """
+    return {
+        # ``name`` is masked for an app token (which can address nothing) and for
+        # every PROJECT row (which nothing can address either: both
+        # ``api_kirocrew_agent_update`` and ``api_kirocrew_agent_delete`` 404 on a
+        # name absent from ``cfg.agents``, and a scanned project agent never is).
+        # A GLOBAL row's name survives for a non-app caller because it is that
+        # row's only handle -- it addresses ``/api/agents/{name}`` for edit and
+        # delete and keys the usage sort -- and masking it there would buy
+        # nothing: the same names are readable unmasked from
+        # ``GET /api/config/kirocrew``, where they are the ``agents`` map's KEYS
+        # and ``_masked_config_dict`` masks only schema-``sensitive`` VALUES.
+        # That last argument does NOT extend to project rows, whose names come
+        # from a filesystem scan and appear in no config, which is why they are
+        # masked here rather than reasoned away.
+        #
+        # Named cost: a project agent whose FILENAME is credential- or
+        # URL-shaped is no longer selectable, because the picker dispatches by
+        # this value (``AgentSelector.tsx:127`` ``onChange(a.name)``). That is
+        # confined to names the redactors would alter; an ordinary project agent
+        # name is byte-identical.
+        "name": _roster_mask(name) if (redact or scope == "project") else name,
+        # The #1684 project-scope tag: "project" rows dispatch only from the
+        # slot whose project they were scanned from. Handler-added, not a
+        # record field.
+        "scope": scope,
+        "kiro_agent": _roster_mask(agent_cfg.kiro_agent),
+        "workspace": _roster_mask(agent_cfg.workspace),
+        "memory_store": _roster_mask(agent_cfg.memory_store),
+        "model": _roster_mask(agent_cfg.model),
+        "reasoning_effort": _roster_mask(agent_cfg.reasoning_effort),
+        "description": _roster_mask(agent_cfg.description),
+        "triggers": _roster_mask(agent_cfg.triggers),
+        "source": _roster_mask(agent_cfg.source),
+        "session_color": _roster_mask(agent_cfg.session_color),
+    }
+
+
 async def api_kirocrew_agents(request: web.Request) -> web.Response:
     """GET /api/agents — list all Kiro Crew agent definitions, most-used first.
 
@@ -2574,8 +2746,13 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
     dispatch resolves aliases first, so the alias is what would answer.
     """
     cfg = KiroCrewConfig.load()
+    # Caller class, resolved once for the whole response. Non-empty ``app`` is an
+    # app token (the same predicate ``members.py::_deny_app_caller`` uses);
+    # empty is the dashboard owner. It decides only VALUE treatment, never the
+    # key set -- see ``_roster_value``.
+    redact = bool(request.get("app", ""))
     agents = [
-        {"name": name, "scope": "global", **dataclasses.asdict(agent_cfg)}
+        _agent_roster_row(name, "global", agent_cfg, redact=redact)
         for name, agent_cfg in cfg.agents.items()
     ]
 
@@ -2599,9 +2776,12 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
         except Exception:
             logger.warning("Failed to list project agents for %s", project_dir, exc_info=True)
             project_names = frozenset()
-        base = dataclasses.asdict(KiroCrewAgentConfig())
+        # One shared default record for every project row — they carry no
+        # per-agent config of their own (nothing on disk to read without a
+        # second scan), so the row is the default record under a project tag.
+        project_default = KiroCrewAgentConfig()
         agents.extend(
-            {"name": name, "scope": "project", **base}
+            _agent_roster_row(name, "project", project_default, redact=redact)
             for name in sorted(project_names - set(cfg.agents.keys()))
         )
 
@@ -3083,6 +3263,26 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "body must be an object", "code": "body_not_object"}, status=400
         )
+    # WRITE-SIDE HALF of the roster mask, and it runs FIRST -- immediately after
+    # the body-object check, before any validation. `GET /api/agents` replaces a
+    # value it cannot show verbatim with `_SENSITIVE_MASK` (`_roster_mask`), and
+    # a client that echoes the record back -- the agents page sends every field
+    # on every save, so that `""` can clear a pin -- would otherwise persist the
+    # mask over the stored original. A field carrying the mask therefore means
+    # "unchanged" and is dropped here, which is the remedy
+    # `_masked_config_dict`'s docstring prescribes verbatim: "MUST treat
+    # `_SENSITIVE_MASK` as 'unchanged' and keep the stored value".
+    #
+    # Ordering is load-bearing, not cosmetic: `model` and `reasoning_effort` are
+    # validated below and would REJECT an echoed mask with a 400, failing an edit
+    # to some unrelated field. Dropping the masked entries before those checks
+    # means a mask can never be validated as if it were content.
+    #
+    # It can run this early only because the predicate matches a FIXED sentinel
+    # and needs no access to the stored record -- a rule that recognised the view
+    # by recomputing the redaction of `agent` would have to wait for the config
+    # load inside the lock, and would therefore sit after these validations.
+    body = {key: val for key, val in body.items() if not _carries_mask(val)}
     if "model" in body:
         pending_model = normalize_agent_model(body["model"])
     # Rejected before the config is even loaded: the check is pure, and every
