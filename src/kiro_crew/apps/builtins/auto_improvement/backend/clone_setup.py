@@ -310,6 +310,18 @@ def _repository_is_safe(repo: Path) -> bool:
         )
     except (OSError, subprocess.SubprocessError):
         return False
+    if proc.returncode != 0:
+        # Exit 1 means "no unsafe keys" only when git itself ran. A sandbox
+        # launcher that dies before git executes also exits 1, so reading the
+        # exit code alone makes this the one probe in the isolation chain that
+        # fails OPEN during a launcher outage (issue #8493): metadata unsafety
+        # becomes invisible exactly when the host cannot run the probes. Same
+        # classifier as :func:`_origin_urls` — the structural stderr match is
+        # what keeps git's own output unable to satisfy it, and the raise says
+        # "the probe could not run" instead of an isolation verdict (#8151).
+        detail = _launcher_failure_detail(proc.stderr or "")
+        if detail is not None:
+            raise IsolationProbeError(detail)
     return proc.returncode == 1
 
 
@@ -650,9 +662,9 @@ def list_clone_branches(clone: Path, *, timeout_s: int = 30) -> tuple[list[str],
     clone = Path(clone)
     if not (clone / ".git").is_dir():
         return [], f"Not a git clone: {clone}"
-    if not _repository_is_safe(clone):
-        return [], "clone Git metadata failed safety verification"
     try:
+        if not _repository_is_safe(clone):
+            return [], "clone Git metadata failed safety verification"
         disabled = _push_disabled(clone)
     except IsolationProbeError as exc:
         return [], str(exc)
@@ -925,9 +937,9 @@ def checkout_branch(clone: Path, branch: str, *, timeout_s: int = 120) -> tuple[
     bare = branch.split("/", 1)[1] if branch.startswith("origin/") else branch
     if not bare or not is_valid_branch_name(bare):
         return False, f"invalid branch name: {branch!r}"
-    if not _repository_is_safe(clone):
-        return False, "clone Git metadata failed safety verification"
     try:
+        if not _repository_is_safe(clone):
+            return False, "clone Git metadata failed safety verification"
         disabled = _push_disabled(clone)
     except IsolationProbeError as exc:
         return False, str(exc)
