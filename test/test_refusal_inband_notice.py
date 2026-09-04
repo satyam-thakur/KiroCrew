@@ -27,6 +27,8 @@ from kiro_crew.dashboard.chat_runner import (
     _steer_policy_notice,
 )
 from kiro_crew.dashboard.state import (
+    _DENY_CAUSE_TEXT,
+    DENY_CAUSE_APPROVAL_TIMEOUT,
     DENY_CAUSE_HOOK_ERROR,
     DENY_CAUSE_INVALID_NAME,
     DENY_CAUSE_POLICY,
@@ -396,6 +398,24 @@ class TestCauseSpecificWording:
         assert "nothing judged the call" in out
         assert "safety policy" not in out
 
+    def test_approval_timeout_says_expired_not_denied_or_blocked(self):
+        out = build_refusal_steer_notice(
+            "bash", "prompt expired after 600s", cause=DENY_CAUSE_APPROVAL_TIMEOUT
+        )
+        assert "expired unanswered" in out
+        assert "never judged" in out
+        # The action was never judged, so neither a policy verdict nor the
+        # policy guidance ("find an allowed alternative") may appear: both
+        # would send the model routing around a call nobody refused.
+        assert "safety policy" not in out
+        assert "allowed alternative" not in out
+        # Reissuing is guaranteed to fail — the window is clamped to what is
+        # left of the turn, so a re-armed prompt lands in the no-budget branch
+        # — and the unattended transcript line already says "instead of
+        # retrying the same call". The guidance must agree with both.
+        assert "state the permission you need" in out.lower()
+        assert "do not immediately reissue" in out.lower()
+
     def test_policy_wording_is_unchanged_by_default(self):
         # Every pre-existing caller passes no cause; the policy text must be
         # byte-identical to what shipped, or the model's correction changes
@@ -409,8 +429,10 @@ class TestCauseSpecificWording:
 
     def test_every_cause_keeps_the_invariant_half(self):
         # The half that does the actual work -- naming the string being corrected
-        # and forbidding a hand-back -- must not vary with the cause.
-        for cause in (DENY_CAUSE_POLICY, DENY_CAUSE_INVALID_NAME, DENY_CAUSE_HOOK_ERROR):
+        # and forbidding a hand-back -- must not vary with the cause. Iterated
+        # over the table itself so a cause added later inherits this guard
+        # instead of silently escaping a hand-enumerated tuple.
+        for cause in _DENY_CAUSE_TEXT:
             out = build_refusal_steer_notice("bash", "why", cause=cause)
             assert "User denied tool execution" in out, cause
             assert "NOT a user action" in out, cause
@@ -421,7 +443,7 @@ class TestCauseSpecificWording:
         # The tag has to be true for all three causes. Saying "policy notice" above
         # a sentence that explains the call was NOT a policy matter contradicts the
         # body one line later, and the body is the part doing the correcting.
-        for cause in (DENY_CAUSE_POLICY, DENY_CAUSE_INVALID_NAME, DENY_CAUSE_HOOK_ERROR):
+        for cause in _DENY_CAUSE_TEXT:
             out = build_refusal_steer_notice("bash", "why", cause=cause)
             assert out.startswith("[Kiro Crew host notice]"), cause
             # "policy" may still appear in the POLICY cause's own clause; what must
