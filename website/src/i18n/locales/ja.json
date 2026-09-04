@@ -13461,6 +13461,7 @@
       "empty_roster": "クルーメンバーはまだいません。クルー管理ページで作成するとここに表示されます。",
       "inherited": "継承",
       "member_count_other": "{{count}} 名のメンバー",
+      "member_gone": "「{{name}}」はメンバー一覧にありません。{{shown}} を表示しています。",
       "memory_shared_note": "メンバーは現在同じメモリを共有しています。あるメンバーに伝えた内容は全員が知ることになります。",
       "memory_store": "メモリストア",
       "model": "モデル",

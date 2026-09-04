@@ -13640,6 +13640,7 @@
       "inherited": "উত্তরাধিকারসূত্রে",
       "member_count_one": "{{count}} জন সদস্য",
       "member_count_other": "{{count}} জন সদস্য",
+      "member_gone": "'{{name}}' এখন আর সদস্য তালিকায় নেই — {{shown}} দেখানো হচ্ছে।",
       "memory_shared_note": "সদস্যরা বর্তমানে একই মেমরি ভাগ করে। একজনকে বলা কথা সবাই জানে।",
       "memory_store": "মেমরি স্টোর",
       "model": "মডেল",
