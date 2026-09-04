@@ -165,6 +165,17 @@ class LessonWriteResult:
     ``/api/lessons`` response, the ``learn_add`` tool result) need the reason; the
     ones that only branch on success do not.
 
+    ``superseded`` names the stored rules THIS CALL DELETED. Every field above
+    describes what happened to the SUBMITTED lesson, and that was the whole
+    vocabulary -- so a write that tombstoned somebody else's stored rule reported
+    a plain ``inserted`` with ``reason=None``, and the caller was told its lesson
+    was saved with nothing naming what the save cost. Supersede-on-dedup is
+    deliberate (see :meth:`VectorMemoryStore.write_lesson`, and the docstring's
+    "longer wins" / "newer replaces older"), and this field does not change it:
+    the same rows are deleted as before, and the caller is now told which. It is
+    empty on every path that deleted nothing, so a surface can render it with a
+    bare ``if`` and say nothing when there is nothing to say.
+
     **Truthiness is deliberate, and it is the reason this replaced the old ``bool``
     outright instead of shipping beside it.** ``write_lesson`` used to answer
     ``True``/``False``, and three callers plus ~55 assertions read that answer with a
@@ -180,6 +191,12 @@ class LessonWriteResult:
 
     outcome: LessonWriteOutcome
     reason: str | None = None
+    #: Rules this call tombstoned. A tuple, not a list, because the dataclass is
+    #: frozen and a mutable default would let a caller edit a write's own record of
+    #: what it destroyed. Defaults to empty so the ~60 existing construction sites
+    #: -- ``LessonWriteResult(OUTCOME)`` and ``LessonWriteResult(OUTCOME, reason)``
+    #: -- are unchanged, and any surface that ignores the field keeps its behaviour.
+    superseded: tuple[str, ...] = ()
 
     def __bool__(self) -> bool:
         """``wrote`` -- the exact predicate the old ``bool`` return answered.
@@ -2537,6 +2554,24 @@ class VectorMemoryStore:
         - Topic overlap: if >50% of significant words match, newer replaces older
         - Semantic similarity: if >85% cosine similarity, longer wins
 
+        Two of those three rules DELETE a stored lesson, and the "longer wins" tie
+        break means a submitted rule can retire a stored one that is more general
+        than it -- attaching a condition to a rule makes the text longer and the
+        guidance NARROWER, so the row that survives can be the one that applies less
+        often. That is the designed behaviour and this method keeps it: the
+        alternative is a store that accumulates near-identical rules, which is what
+        these three rules exist to prevent, and the onboarding import already shows
+        the sanctioned way to opt out of it (route to ``set_semantic_if_absent``,
+        which cannot replace anything -- see ``onboarding_import``).
+
+        What it does NOT keep is the silence. Every rule that deletes now records the
+        rule text it removed in :attr:`LessonWriteResult.superseded`, so a caller is
+        no longer handed a bare ``inserted`` for a call that destroyed a lesson the
+        user still wanted. The result is the only place that can carry this: the
+        deleted row is a tombstone, so it is gone from ``get_lessons``, from
+        ``learn_list`` and from the injected lessons block by the time the caller
+        looks.
+
         Pass ``rule_emb`` to reuse an embedding already computed by the caller
         and avoid a second blocking embed of the identical text. A caller doing
         that MUST also read :attr:`space_generation` BEFORE it embeds and pass it
@@ -2823,6 +2858,14 @@ class VectorMemoryStore:
         # for every row) rather than per candidate — see _stored_similarity_scorer.
         similarity = self._stored_similarity_scorer(rule_emb) if rule_emb else None
 
+        # Every row this scan tombstones, in the order it went. Collected rather
+        # than counted: a count tells the caller a lesson is gone without telling it
+        # WHICH, and the row is a tombstone by the time the caller could look it up.
+        # Populated at all three delete sites below, never at pass 1's -- pass 1
+        # rewrites one row under its own key and deletes nothing, and ``matched``
+        # skips this scan entirely, so an ``enriched`` result always reports none.
+        superseded: list[str] = []
+
         for existing in [] if matched else lesson_rows:
             existing_text = _as_text(existing)
             if existing_text is None:
@@ -2833,8 +2876,22 @@ class VectorMemoryStore:
             if rule_lower in existing_lower:
                 logger.info("Lesson dedup: %r already covered by %r", rule[:60], existing["key"])
                 _flush_backfills()
-                return LessonWriteResult(LessonWriteOutcome.DEDUPED, "substring_covered")
+                return LessonWriteResult(
+                    LessonWriteOutcome.DEDUPED, "substring_covered", tuple(superseded)
+                )
             if existing_lower in rule_lower:
+                # This branch was the only one of the four here that deleted a row
+                # WITHOUT saying so at any level: its three siblings each log, and
+                # this one went straight to delete_semantic. So the deletion left no
+                # trace a user or an operator could find -- not in the result, not in
+                # the log, and not in the store, since the row is tombstoned and
+                # every read path filters it. Log like the siblings do.
+                logger.info(
+                    "Lesson supersede: %r contains and replaces %r",
+                    rule[:60],
+                    existing_text[:60],
+                )
+                superseded.append(existing_text)
                 self.delete_semantic(existing["key"], source)
                 continue
 
@@ -2851,6 +2908,7 @@ class VectorMemoryStore:
                             existing_text[:60],
                             ratio * 100,
                         )
+                        superseded.append(existing_text)
                         self.delete_semantic(existing["key"], source)
                         continue
 
@@ -2892,18 +2950,27 @@ class VectorMemoryStore:
                                 for b, k, g in pending_backfills
                                 if k != existing["key"]
                             ]
+                            superseded.append(existing_text)
                             self.delete_semantic(existing["key"], source)
                         else:
                             _flush_backfills()
                             return LessonWriteResult(
-                                LessonWriteOutcome.DEDUPED, "semantic_similarity"
+                                LessonWriteOutcome.DEDUPED,
+                                "semantic_similarity",
+                                tuple(superseded),
                             )
 
         _flush_backfills()
 
         err = self.set_semantic(key, value, confidence, source)
         if err is not None:
-            return LessonWriteResult(LessonWriteOutcome.REFUSED, err[0].value)
+            # Carries ``superseded`` too, and this is the path where it matters most:
+            # the scan above already deleted, so a refusal here means rows were
+            # destroyed and NOTHING was stored in their place. The preflight was
+            # added to keep this unreachable for the values it can screen; a refusal
+            # that gets past it must still name the cost rather than report a bare
+            # refusal for a call that emptied part of the store.
+            return LessonWriteResult(LessonWriteOutcome.REFUSED, err[0].value, tuple(superseded))
         if rule_emb:
             emb_blob = struct.pack(f"{len(rule_emb)}f", *rule_emb)
             with self._db_lock:
@@ -2924,7 +2991,8 @@ class VectorMemoryStore:
         # superseded an older row first, since the caller's lesson did not exist under
         # this key before. Same two words the JSONL store uses for the same events.
         return LessonWriteResult(
-            LessonWriteOutcome.ENRICHED if matched else LessonWriteOutcome.INSERTED
+            LessonWriteOutcome.ENRICHED if matched else LessonWriteOutcome.INSERTED,
+            superseded=tuple(superseded),
         )
 
     @staticmethod

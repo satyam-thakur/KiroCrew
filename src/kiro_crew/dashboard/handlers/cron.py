@@ -1212,6 +1212,7 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         outcome = result.outcome.value
         reason = result.reason
         stored = result.stored
+        superseded = list(result.superseded)
         if result.wrote:
             candidates = await asyncio.to_thread(
                 vs.find_contradiction_candidates, rule, 0.4, 0.85, rule_emb, repo_scope
@@ -1254,6 +1255,14 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         outcome = await asyncio.to_thread(store.save_or_enrich, lesson)
         reason = None
         stored = True
+        # A genuine empty, not an unfilled field. ``_insert_or_enrich`` has no dedup
+        # rule that supersedes: it matches on exact rule text plus scope and either
+        # attaches a clause or reports ``unchanged``, appending every other record
+        # untouched -- so this store keeps both a general rule and the narrower rule
+        # containing it, which the vector store does not. (It can still drop the
+        # oldest record to the ``_MAX_LESSONS_TOTAL`` cap, but that is an eviction,
+        # not this write superseding a rule it overlaps.)
+        superseded = []
     # Refreshed unconditionally, and deliberately so. An earlier revision of this
     # change gated the push on the write having landed, which is wrong: a DECLINING
     # outcome can still have mutated the store. ``write_lesson``'s second pass
@@ -1273,8 +1282,14 @@ async def api_lessons_create(request: web.Request) -> web.Response:
     # caller its lesson was saved even when the store had refused the value; the
     # ``learn_add`` tool and the CLI both reported "Saved" on that response.
     # ``outcome`` and ``reason`` are additive, so a client that only reads ``ok``
-    # keeps working.
-    return web.json_response({"ok": stored, "outcome": outcome, "reason": reason})
+    # keeps working. ``superseded`` is additive for the same reason, and it is the
+    # only channel that can carry the rules this write DELETED: they are tombstoned,
+    # so a client that re-reads /api/lessons after this response cannot see what it
+    # lost. Always present, empty when nothing was superseded, so a client does not
+    # have to tell "no deletions" from "this gateway is too old to say".
+    return web.json_response(
+        {"ok": stored, "outcome": outcome, "reason": reason, "superseded": superseded}
+    )
 
 
 async def api_lessons_delete(request: web.Request) -> web.Response:
