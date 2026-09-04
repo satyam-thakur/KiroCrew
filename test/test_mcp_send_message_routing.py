@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import pytest
 
-from kiro_crew.mcp_tools.messaging import schemas
+from kiro_crew.constants import CHANNEL_SESSION_NAMESPACES
+from kiro_crew.mcp_tools.messaging import _CHANNEL_SESSIONS, schemas
 from kiro_crew.validation import SEND_MESSAGE_SCHEMA, ValidationError, validate_tool_args
 
 
@@ -103,3 +104,192 @@ def test_an_opaque_base64_room_id_is_accepted() -> None:
 def test_a_plain_send_still_validates_without_the_pair() -> None:
     # The fields are additive: a caller that never routes is unaffected.
     assert validate_tool_args({"text": "hi"}, SEND_MESSAGE_SCHEMA)["text"] == "hi"
+
+
+# ── The channel-session roster (issue #6514) ──
+#
+# The tool refuses a ``session`` value it does not recognise, so this roster is a
+# gate in FRONT of the gateway's owner-DM leg. That leg
+# (``_deliver_channel_dm``) is channel-neutral by construction, so a roster
+# narrower than the gateway's does not disable a feature visibly -- it refuses a
+# destination the plumbing behind it would have served, which is what #6514
+# reported for Webex.
+
+
+def test_the_channel_session_roster_matches_the_gateways() -> None:
+    """Neither side may name a channel the other does not.
+
+    Now an IDENTITY rather than an equality: both read
+    ``constants.CHANNEL_SEND_NAMESPACES``, so the subtraction that used to be
+    respelled at each reader cannot diverge. Kept as a test because the coupling
+    is the point -- a value one side accepts and the other rejects is a call that
+    fails after the agent was told it was legal, and the reverse is #6514.
+    """
+    from kiro_crew.constants import CHANNEL_SEND_NAMESPACES
+    from kiro_crew.dashboard.handlers.messaging import _SEND_MESSAGE_CHANNEL_TYPES
+
+    assert _CHANNEL_SESSIONS is CHANNEL_SEND_NAMESPACES
+    assert set(_CHANNEL_SESSIONS) == set(_SEND_MESSAGE_CHANNEL_TYPES)
+    assert set(CHANNEL_SEND_NAMESPACES) == set(CHANNEL_SESSION_NAMESPACES) - {
+        "slack",
+        "unified",
+    }
+
+
+def test_webex_is_an_accepted_channel_session() -> None:
+    """#6514's own call. Named explicitly so a roster regression cites the issue."""
+    assert "webex" in _CHANNEL_SESSIONS
+    assert "webex" in _advertised()["session"]["enum"]
+
+
+@pytest.mark.parametrize("session", ["unified", "slack", "origin"])
+def test_a_reserved_value_is_never_a_channel_session(session: str) -> None:
+    """``unified`` is a session-key bucket and ``slack``/``origin`` are modes.
+
+    Widening the roster must not sweep these in: ``slack`` has its own client and
+    is absent from ``channel_transports``, so routing it down the channel leg
+    would fail every such send closed for no stateable reason.
+    """
+    assert session not in _CHANNEL_SESSIONS
+
+
+def test_webex_advertises_a_resolvable_owner_dm_target() -> None:
+    """The capability claim behind the roster widening, on the real transport.
+
+    Real, not a double: the claim is that the gateway's channel-neutral resolver
+    can serve Webex from Webex's OWN configured-target allowlist, so a stub that
+    invents the target id would prove nothing about Webex's spelling of it.
+    """
+    from kiro_crew.dashboard.handlers.messaging import _owner_dm_target
+    from kiro_crew.webex.transport import WebexTransport
+
+    transport = WebexTransport(client=object(), allowed_emails=["owner@example.invalid"])
+
+    assert _owner_dm_target(transport) == "user:owner@example.invalid"
+
+
+def test_an_ambiguous_webex_allowlist_is_refused_rather_than_guessed() -> None:
+    """Why widening the roster does not widen the audience.
+
+    With no owner field on the channel, two allow-listed people mean no inferable
+    recipient, and picking one would send private agent output to the wrong human.
+    The empty answer degrades to the dashboard notification instead.
+    """
+    from kiro_crew.dashboard.handlers.messaging import _owner_dm_target
+    from kiro_crew.webex.transport import WebexTransport
+
+    transport = WebexTransport(
+        client=object(), allowed_emails=["a@example.invalid", "b@example.invalid"]
+    )
+
+    assert _owner_dm_target(transport) == ""
+
+
+def test_a_channel_that_cannot_dm_proactively_is_in_the_roster_but_yields_no_target() -> None:
+    """The asymmetry the derivation must NOT flatten, on a real transport.
+
+    Channels differ because platforms differ, and a roster is the wrong place to
+    encode that: Feishu can only reply to an inbound message, so it declares its
+    DM targets unavailable with a reason. Being accepted by ``session`` and being
+    deliverable are therefore separate questions, answered in separate places --
+    the roster admits the value, and ``_owner_dm_target`` declines the send at the
+    side-effect boundary where live config can be read.
+
+    Webex passes the same gate because its platform genuinely permits the send
+    (``toPersonEmail`` opens the 1:1 space server-side), not because the gate is
+    lenient. Pinned on the real ``FeishuTransport`` because a stub with
+    ``available=False`` would prove only that the filter reads the flag, not that
+    a shipped channel sets it.
+    """
+    from kiro_crew.dashboard.handlers.messaging import _owner_dm_target
+    from kiro_crew.feishu.transport import FeishuTransport
+
+    transport = FeishuTransport(client=object(), allowed_open_ids=["ou_notarealid"])
+
+    assert "feishu" in _CHANNEL_SESSIONS
+    assert [t.available for t in transport.configured_targets()] == [False]
+    assert _owner_dm_target(transport) == ""
+
+
+def test_the_roster_move_did_not_change_the_roster() -> None:
+    """``constants`` is the new home; ``messaging.link`` re-exports the same object.
+
+    The move exists to break an import cycle, so it must be observationally inert
+    for the roster's existing readers -- several of which import it from
+    ``messaging.link`` and are unaware of the move.
+    """
+    from kiro_crew.constants import CHANNEL_SESSION_NAMESPACES as canonical
+    from kiro_crew.messaging.link import CHANNEL_SESSION_NAMESPACES as re_exported
+
+    assert canonical is re_exported
+    assert canonical == (
+        "slack",
+        "discord",
+        "telegram",
+        "whatsapp",
+        "webex",
+        "wecom",
+        "teams",
+        "weixin",
+        "imessage",
+        "feishu",
+        "unified",
+    )
+
+
+def test_a_channel_session_forwards_a_strict_caller_session_when_one_exists() -> None:
+    """The gateway must re-vet a channel session under the CALLER's identity.
+
+    A channel ``session`` leaves over the same transports as ``channel_type``, so
+    omitting ``caller_session`` makes the gateway fall back to the host sentinel
+    and vet the wrong principal. Resolved STRICTLY: the lenient resolver walks
+    process ancestors, which would hand a sub-agent its parent's channel
+    permissions at the egress gate.
+    """
+    from unittest.mock import patch
+
+    from kiro_crew.mcp_tools import messaging as tool
+
+    with (
+        patch.object(tool.mcp_core, "_resolve_session_key", return_value="dashboard:7"),
+        patch.object(
+            tool.mcp_core, "require_strict_session_key", return_value=("webex:a:dm:u1", "")
+        ),
+        patch.object(tool.mcp_core, "_post") as post,
+    ):
+        post.return_value = {"ok": True, "delivered_to": "webex"}
+        tool.send_message("send_message", {"text": "hi", "session": "webex"})
+
+    assert post.call_args.args[1]["caller_session"] == "webex:a:dm:u1"
+    assert post.call_args.kwargs["session_key"] == "webex:a:dm:u1"
+
+
+def test_a_channel_session_without_a_strict_key_is_refused() -> None:
+    """An unattributable channel-session send is refused, and refusing is the point.
+
+    ``gov_session`` falls back to the LENIENT resolver, which walks process
+    ancestors, so an unidentified sub-agent resolves to its parent and the
+    channel-agent containment check (keyed on an identity starting ``channel:``)
+    does not fire for a contained agent. That is a confinement bypass onto the
+    owner-DM egress surface, and the gateway's fail-closed ``channels`` re-vet
+    does not backstop it -- that gate covers the transport scope, not containment.
+
+    It costs no legitimate caller: the gateway injects ``KIROCREW_SESSION_KEY``
+    into every agent subprocess and cron runs carry ``cron:<job_id>`` in it, so
+    the refusal only reaches a caller that genuinely cannot be attributed.
+    """
+    from unittest.mock import patch
+
+    from kiro_crew.mcp_tools import messaging as tool
+
+    with (
+        patch.object(tool.mcp_core, "_resolve_session_key", return_value=""),
+        patch.object(
+            tool.mcp_core, "require_strict_session_key", return_value=("", "Error: refused")
+        ),
+        patch.object(tool.mcp_core, "_post") as post,
+    ):
+        result = tool.send_message("send_message", {"text": "hi", "session": "webex"})
+
+    assert result.startswith("Error:")
+    post.assert_not_called()

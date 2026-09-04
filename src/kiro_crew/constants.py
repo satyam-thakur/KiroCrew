@@ -380,6 +380,66 @@ AWS_PROFILE_CHARS = "A-Za-z0-9_.+-"
 AWS_PROFILE_NAME_PATTERN = f"^[{AWS_PROFILE_FIRST_CHARS}][{AWS_PROFILE_CHARS}]{{0,127}}\\Z"
 AWS_PROFILE_NAME_RE = re.compile(AWS_PROFILE_NAME_PATTERN)
 
+SLACK_NAMESPACE = "slack"
+
+#: Session-key namespaces owned by a messaging channel, i.e. every prefix a
+#: conversation started OUTSIDE the dashboard can carry. Slack keys are
+#: ``slack:<thread_ts>``; every other transport uses
+#: ``{channel}:{agent}:{chatType}:{user}[:genN]`` (see
+#: ``messaging.link.build_dm_session_key``), plus the ``unified:`` bucket that
+#: ``dm_scope="unified"`` collapses direct DMs into.
+#:
+#: Deliberately excludes the non-channel namespaces that also contain a colon
+#: (``dashboard:``, ``cron:``, ``hook:``, ``subagent:``, ``channel:``) — those
+#: are surfaced by their own owners, not by the channel-session reconciler.
+#:
+#: NOTE: ``autonudge._CHANNEL_KEY_PREFIXES`` is a SEPARATE hand-kept copy. It is
+#: often described as narrower; as of this writing it is not -- both hold the same
+#: 11 namespaces. It answers a different question (does this key SHAPE belong to a
+#: channel rather than a dashboard slot), which is why it lists namespaces nothing
+#: can currently be delivered to. Deriving it from here would be sound and is
+#: deliberately left out of the change that homed this roster; until then, do not
+#: assume the two have diverged, and do not assume they are kept in step either.
+#:
+#: HOMED HERE, not in ``messaging.link``, because the roster has readers on both
+#: sides of an import cycle. ``messaging.link`` is itself stdlib-only, but
+#: importing anything from it executes ``messaging/__init__.py`` first, which
+#: pulls in ``driver`` -> ``acp`` -> ``hooks``; a reader that ``hooks`` is already
+#: mid-import for (``hooks`` -> ``webhooks`` -> ``validation``) then fails with a
+#: partially-initialized ``hooks``. This module imports only ``os`` and ``re``, so
+#: it can be read from anywhere. ``messaging.link`` re-exports both names, which
+#: is where the rest of the codebase still reads them from.
+CHANNEL_SESSION_NAMESPACES: tuple[str, ...] = (
+    SLACK_NAMESPACE,
+    "discord",
+    "telegram",
+    "whatsapp",
+    "webex",
+    "wecom",
+    "teams",
+    "weixin",
+    "imessage",
+    "feishu",
+    "unified",
+)
+
+#: The channels a PROACTIVE send may name -- ``send_message``'s ``channel_type``
+#: and its channel ``session`` values. Derived ONCE here rather than subtracted at
+#: each reader: the same subtraction was spelled in three places, which is the
+#: drift shape that made a Webex owner DM unreachable while the gateway leg behind
+#: it already worked (#6514), one level up.
+#:
+#: Two members of the roster cannot be a send target:
+#:
+#: * ``slack`` has its own client and streaming path and is deliberately absent
+#:   from ``state.channel_transports``, so the shared ladder skips it. It is
+#:   spelled ``session="slack"``.
+#: * ``unified`` is the session-key bucket ``dm_scope="unified"`` collapses DMs
+#:   into, not a transport; no ``ChannelLink`` ever carries it as a channel type.
+CHANNEL_SEND_NAMESPACES: tuple[str, ...] = tuple(
+    sorted(set(CHANNEL_SESSION_NAMESPACES) - {SLACK_NAMESPACE, "unified"})
+)
+
 # The product wordmark, figlet `small`. ONE definition on purpose: copy-pasting
 # it into cli.py and cli_chat.py risks a rename leaving a stale product name in
 # the two most-seen surfaces (bare `kirocrew`, the chat REPL). Import it; never
