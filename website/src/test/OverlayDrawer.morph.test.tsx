@@ -148,3 +148,52 @@ describe('OverlayDrawer morph clip', () => {
     reduceMotion = false
   })
 })
+
+describe('OverlayDrawer slide mode', () => {
+  // The framer-motion mock forwards every prop it does not read (`style`,
+  // `x`, `width`) straight onto the DOM element, so the merged style object is
+  // observable there. `x` is a MotionValue in production; here it is passed as a
+  // plain value purely to assert it survives the merge and is not overridden by
+  // `slideStyle`.
+  const X = 'X-MOTION-VALUE' as unknown as import('framer-motion').MotionValue<number>
+
+  const slidePanel = (over: Partial<React.ComponentProps<typeof OverlayDrawer>> = {}) => {
+    const { container } = render(
+      <OverlayDrawer open width={320} slideX={X} {...over}>
+        <div data-testid="panel">panel</div>
+      </OverlayDrawer>,
+    )
+    return container.querySelector('.overflow-hidden') as HTMLElement
+  }
+
+  it('merges the caller vertical pin and keeps x/width unoverridden', () => {
+    reduceMotion = false
+    // Plain px values here: happy-dom's CSS parser drops a `calc(env(…))` value
+    // as invalid, so a calc test would assert nothing. The order and the merge
+    // are what this pins, not the parser's `env()` support.
+    const panel = slidePanel({ slideStyle: { top: '58px', height: '400px' } })
+    const style = panel.getAttribute('style') ?? ''
+    // The caller's vertical pin lands as LAYOUT properties…
+    expect(style).toContain('top: 58px')
+    expect(style).toContain('height: 400px')
+    // …the width the caller passed survives the merge…
+    expect(style).toContain('width: 320px')
+    // …and `x` (the transform channel, a MotionValue in production) is still
+    // applied — slideStyle was spread first, so it cannot displace it. A
+    // competing vertical transform would be a bug; the pin is top/height.
+    expect(style).toContain('x: X-MOTION-VALUE')
+    expect(style).not.toContain('translateY')
+    expect(panel.querySelector('[data-testid="panel"]')).toBeTruthy()
+  })
+
+  it('is a no-op when no vertical pin is supplied (the desktop-free slide branch)', () => {
+    reduceMotion = false
+    const panel = slidePanel()
+    const style = panel.getAttribute('style') ?? ''
+    // Nothing forces a top when the caller passes no slideStyle; x/width remain.
+    expect(style).not.toContain('top:')
+    expect(style).toContain('width: 320px')
+    expect(style).toContain('x: X-MOTION-VALUE')
+    expect(panel.querySelector('[data-testid="panel"]')).toBeTruthy()
+  })
+})

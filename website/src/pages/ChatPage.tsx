@@ -4,6 +4,7 @@ import { useLocation, useNavigate, useNavigationType, useSearchParams } from 're
 import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useModelsDegraded } from '../providers/modelListHealth'
 import { useIsMobile } from '../hooks/useIsMobile'
+import { useVisualViewport } from '../hooks/useVisualViewport'
 import { useImeGuard } from '../hooks/useImeGuard'
 import { useRailWidth } from '../hooks/useRailWidth'
 import { SETTINGS_DEFAULT_MODEL_ID } from '../hooks/useSettingHighlight'
@@ -1164,6 +1165,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // effect reads it (mobile replaces rather than pushes a session switch), and
   // that effect is defined well above where the layout hooks start.
   const isMobile = useIsMobile()
+  // The mobile sessions drawer and its scrim are `fixed` overlays that autofocus
+  // a search input, so a software keyboard is open whenever they are. iOS Safari
+  // shrinks only the VISUAL viewport for the keyboard (`interactive-widget`
+  // default `resizes-visual`), so `fixed inset-0` / `top-safe`/`bottom-safe`
+  // insets keep measuring the full layout viewport and strand the drawer's lower
+  // content behind the keyboard. Pin both to the visual viewport, exactly as the
+  // command palette does — only on mobile; desktop morph mode is untouched.
+  const vv = useVisualViewport()
   const slots = useAppSelector(s => s.dashboard.slots)
   // Unified chat view: show default, orchestrator and crew slots together.
   // App-owned worker slots (s.app) are excluded by the sidebar itself.
@@ -8394,7 +8403,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           <motion.div
             key="sessions-backdrop"
             data-testid="sessions-backdrop"
-            className="fixed inset-0 z-[46] bg-black/50 backdrop-blur-sm"
+            // Pinned to the VISUAL viewport, not `inset-0`: a keyboard shrinks
+            // the visual viewport on every browser, but only Chromium also
+            // shrinks the layout one, so on iOS Safari an `inset-0` scrim keeps
+            // its full height and the drawer's lower half sits behind the
+            // keyboard, unreachable. `top`/`height` follow the visible band.
+            className="fixed left-0 right-0 z-[46] bg-black/50 backdrop-blur-sm"
             // ^ Frosted, matching every other scrim in the app (App.tsx's own
             // mobile nav backdrop is the same three classes). Kept adjacent to
             // `key` — the composer-chrome occlusion guard anchors its z-order
@@ -8405,7 +8419,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
             // and deferring it to the settled state (the blur arriving after
             // the panel had stopped read as a second event).
             ref={drawerScrimRef}
-            style={{ opacity: drawerScrim }}
+            style={{ opacity: drawerScrim, top: vv.offsetTop, height: vv.height }}
             // Ignored while a drag owns the panel: the release that ends a
             // close gesture lands here as a click, and treating it as a
             // tap-to-dismiss would run a second close over the settle.
@@ -8479,7 +8493,19 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           />
         </div>
       ) : (
-      <OverlayDrawer open={isMobile ? drawerMounted : sidebarOpen} width={isMobile ? Math.max(0, winW - DRAWER_UNCOVERED_PX) : effectiveSidebarWidth} dragging={sidebarDragging} slideX={isMobile ? drawerX : undefined} slideRef={drawerPanelRef} morph={!isMobile} morphTarget={TOGGLE_RECT} expandFrom={expandFrom} contentH={Math.max(0, containerH - 8)} className={isMobile ? 'mobile-sessions-overlay fixed top-safe-offset-[42px] bottom-safe left-safe z-50 bg-bg-elevated !py-0 rounded-r-xl shadow-lg [&>*]:!rounded-none [&>*]:!border-0 [&>*]:!m-0' : ''}>
+      <OverlayDrawer open={isMobile ? drawerMounted : sidebarOpen} width={isMobile ? Math.max(0, winW - DRAWER_UNCOVERED_PX) : effectiveSidebarWidth} dragging={sidebarDragging} slideX={isMobile ? drawerX : undefined} slideRef={drawerPanelRef}
+        // Mobile only: pin the panel's VERTICAL extent to the visual viewport,
+        // not the layout one. This replaces the safe-offset top / bottom-safe
+        // insets, which measure the layout viewport the keyboard does not shrink
+        // on iOS. `left-safe` (horizontal) and `width` stay on the className; the
+        // `x` slide is untouched (OverlayDrawer applies width and x AFTER this
+        // style, so neither can be overridden here). The 42px header gap and both
+        // safe insets are preserved, now anchored to the visible band.
+        slideStyle={isMobile ? {
+          top: `calc(${vv.offsetTop}px + env(safe-area-inset-top) + 42px)`,
+          height: `calc(${vv.height}px - env(safe-area-inset-top) - env(safe-area-inset-bottom) - 42px)`,
+        } : undefined}
+        morph={!isMobile} morphTarget={TOGGLE_RECT} expandFrom={expandFrom} contentH={Math.max(0, containerH - 8)} className={isMobile ? 'mobile-sessions-overlay fixed left-safe z-50 bg-bg-elevated !py-0 rounded-r-xl shadow-lg [&>*]:!rounded-none [&>*]:!border-0 [&>*]:!m-0' : ''}>
         <ChatSidebar
           slots={filteredSlots}
           activeSlot={activeSlot}

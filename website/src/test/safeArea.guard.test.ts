@@ -63,6 +63,15 @@ const ALLOWLIST: ReadonlyArray<{ file: string; classes: string; reason: string }
     classes: 'fixed left-0 right-0 z-[9999] flex items-start justify-center',
     reason: 'Same full-bleed backdrop as CommandPalette — the bar it centres carries no edge pin.',
   },
+  {
+    file: 'src/pages/ChatPage.tsx',
+    classes: 'fixed left-0 right-0 z-[46] bg-black/50 backdrop-blur-sm',
+    reason:
+      'Full-bleed dim scrim behind the mobile sessions drawer. Pinned to the VISUAL viewport '
+      + '(top/height via vv) rather than inset-0 so a keyboard cannot strand it; left/right run '
+      + 'edge-to-edge on purpose, and insetting them would leave an unpainted strip beside the '
+      + 'notch in landscape. The drawer panel it dims carries its own left-safe inset.',
+  },
 ]
 
 /**
