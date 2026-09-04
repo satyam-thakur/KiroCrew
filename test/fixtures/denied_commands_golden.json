@@ -892,5 +892,11 @@
     "pattern": "(?:(?:os\\.system|os\\.popen|os\\.exec\\w*|(?:asyncio\\.)?create_subprocess_\\w*|(?:\\w+\\.)?(?:run|call|check_call|check_output|popen|Popen|getoutput|getstatusoutput)|commands\\.getoutput|popen\\d?|system|shell_exec|passthru|proc_open|child_process\\.exec\\w*|exec\\w*sync|spawn\\w*|kernel\\.system|io\\.popen)(?:\\s*\\(?\\s*[a-z]{0,2}['\"][^'\"]*\\b(?:pkill|killall)\\b[^'\"]*\\b(?:kiro[-.]?crew|irocrew)\\b|[\\s\\(\\[]*['\"][\\w.:/\\\\-]*(?:pkill|killall)['\"][\\s,\\[\\]\\(\\)+*'\"=\\w-]*['\"][^'\"]*(?:kiro[-.]?crew|irocrew))|(?:os\\.kill(?:pg)?|process\\.kill|\\bkillpg)\\s*\\([^)]*irocrew)",
     "category": "self-protection",
     "description": "Blocks an interpreter payload that terminates a kirocrew process through a library call rather than as a shell command -- a pkill/killall command and the product name inside one quoted string passed to an executing sink such as `os.system(...)` or `execSync(...)`. Sink-qualified so prose, a commit message or a regex literal naming both is not a kill."
+  },
+  {
+    "id": "credential-exfil-aws-credential-path-var",
+    "pattern": "(?:\\$\\{?|%|!|\\$env:)(?:AWS_CONFIG_FILE|AWS_SHARED_CREDENTIALS_FILE)(?![\\w])",
+    "category": "credential-exfil",
+    "description": "Blocks a command that DEREFERENCES `AWS_CONFIG_FILE` or `AWS_SHARED_CREDENTIALS_FILE` (`$NAME`, `${NAME}`, `%NAME%`, `!NAME!`, `$env:NAME`). Both hold a path to an AWS credential file, and the deny matchers do not expand variables, so the reference would otherwise be a working alias for a path the sensitive-path gate refuses by name. Setting or exporting either variable is still allowed -- only reading through it is denied."
   }
 ]

@@ -1742,6 +1742,165 @@ class TestPodConfigWrite:
         assert not list(home.glob("*.tmp"))
 
 
+@requires_posix_pod_lifecycle
+class TestSeedPodOsHome:
+    """``_seed_pod_os_home`` -- seeds a pod's OS-home ``.aws/sso/cache`` from
+    the REAL host's, so ``kiro-cli login`` on the operator's own machine still
+    signs in every pod, while a pod's OWN MCP OAuth grants stay confined to
+    ``os_home`` (see ``build_pod_env``'s ``KIROCREW_OS_HOME`` docstring).
+
+    ``Path.home()`` inside these tests resolves to the module's autouse
+    per-test ``HOME`` pin, not the real invoking user's home -- see the
+    fixture at the top of this file. Tests populate THAT pinned real home's
+    ``.aws/sso/cache`` to stand in for "the real host".
+    """
+
+    def test_copies_the_real_hosts_sso_token(self, tmp_path: Path) -> None:
+        real_cache = Path.home() / ".aws" / "sso" / "cache"
+        real_cache.mkdir(parents=True)
+        (real_cache / "kiro-auth-token.json").write_text('{"accessToken": "real"}')
+
+        os_home = tmp_path / "os-home"
+        rt._seed_pod_os_home(os_home)
+
+        staged = os_home / ".aws" / "sso" / "cache" / "kiro-auth-token.json"
+        assert staged.read_text() == '{"accessToken": "real"}'
+
+    def test_copies_the_cli_flow_token_too(self, tmp_path: Path) -> None:
+        """kiro-cli writes a separate token for its CLI-flow sign-in."""
+        real_cache = Path.home() / ".aws" / "sso" / "cache"
+        real_cache.mkdir(parents=True)
+        (real_cache / "kiro-auth-token-cli.json").write_text('{"accessToken": "cli-flow"}')
+
+        os_home = tmp_path / "os-home"
+        rt._seed_pod_os_home(os_home)
+
+        staged = os_home / ".aws" / "sso" / "cache" / "kiro-auth-token-cli.json"
+        assert staged.read_text() == '{"accessToken": "cli-flow"}'
+
+    def test_never_copies_an_mcp_oauth_grant_pair(self, tmp_path: Path) -> None:
+        """The core isolation requirement: the two-file, sha256-named MCP
+        grant pairs must NEVER be seeded forward. Seeding one would make a
+        pod boot already "Connected" to a provider nobody consented to from
+        inside it."""
+        from kiro_crew import mcp_grant
+
+        real_cache = Path.home() / ".aws" / "sso" / "cache"
+        real_cache.mkdir(parents=True)
+        key = mcp_grant.grant_key("https://mcp.example.com/mcp")
+        (real_cache / f"{key}.token.json").write_text("{}")
+        (real_cache / f"{key}.registration.json").write_text("{}")
+        (real_cache / "kiro-auth-token.json").write_text('{"accessToken": "real"}')
+
+        os_home = tmp_path / "os-home"
+        rt._seed_pod_os_home(os_home)
+
+        staged_dir = os_home / ".aws" / "sso" / "cache"
+        staged_names = {p.name for p in staged_dir.iterdir()}
+        assert staged_names == {"kiro-auth-token.json"}
+
+    def test_is_create_only_and_never_clobbers_an_existing_pod_token(self, tmp_path: Path) -> None:
+        """Re-running boot against an already-seeded pod home (e.g. a
+        restart) must not overwrite a token the pod may have refreshed on
+        its own."""
+        real_cache = Path.home() / ".aws" / "sso" / "cache"
+        real_cache.mkdir(parents=True)
+        (real_cache / "kiro-auth-token.json").write_text('{"accessToken": "real"}')
+
+        os_home = tmp_path / "os-home"
+        staged_cache = os_home / ".aws" / "sso" / "cache"
+        staged_cache.mkdir(parents=True)
+        (staged_cache / "kiro-auth-token.json").write_text('{"accessToken": "pod-refreshed"}')
+
+        rt._seed_pod_os_home(os_home)
+
+        assert (staged_cache / "kiro-auth-token.json").read_text() == (
+            '{"accessToken": "pod-refreshed"}'
+        )
+
+    def test_missing_real_cache_boots_signed_out_rather_than_aborting(self, tmp_path: Path) -> None:
+        """A signed-out operator's host still boots a pod -- it can prompt for
+        sign-in inside the pod, which is strictly better than refusing to
+        boot at all."""
+        os_home = tmp_path / "os-home"
+        rt._seed_pod_os_home(os_home)  # no ~/.aws/sso/cache exists at all
+        assert (os_home / ".aws" / "sso" / "cache").is_dir()
+        assert not list((os_home / ".aws" / "sso" / "cache").iterdir())
+
+    def test_unreadable_real_cache_boots_signed_out_rather_than_aborting(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real_cache = Path.home() / ".aws" / "sso" / "cache"
+        real_cache.mkdir(parents=True)
+        (real_cache / "kiro-auth-token.json").write_text('{"accessToken": "real"}')
+
+        def _boom(self, *_a, **_kw):
+            raise OSError("EACCES")
+
+        monkeypatch.setattr(Path, "glob", _boom)
+        os_home = tmp_path / "os-home"
+        rt._seed_pod_os_home(os_home)  # must not raise
+        assert (os_home / ".aws" / "sso" / "cache").is_dir()
+
+    def test_os_home_and_cache_tree_are_owner_only(self, tmp_path: Path) -> None:
+        os_home = tmp_path / "os-home"
+        rt._seed_pod_os_home(os_home)
+        assert stat.S_IMODE(os_home.stat().st_mode) == 0o700
+        assert stat.S_IMODE((os_home / ".aws" / "sso" / "cache").stat().st_mode) == 0o700
+
+    def test_staged_token_is_owner_only(self, tmp_path: Path) -> None:
+        real_cache = Path.home() / ".aws" / "sso" / "cache"
+        real_cache.mkdir(parents=True)
+        (real_cache / "kiro-auth-token.json").write_text('{"accessToken": "real"}')
+
+        os_home = tmp_path / "os-home"
+        rt._seed_pod_os_home(os_home)
+
+        staged = os_home / ".aws" / "sso" / "cache" / "kiro-auth-token.json"
+        assert stat.S_IMODE(staged.stat().st_mode) == 0o600
+
+    @requires_posix_pod_lifecycle
+    def test_never_copies_the_host_token_through_a_planted_symlink(self, tmp_path: Path) -> None:
+        """The seeding copies a HOST credential and re-runs on every boot, so a
+        link planted at any component of the pod's OS-home would deposit the
+        operator's SSO token wherever it points -- an agent-readable workspace,
+        for instance. Every component is created through a pinned no-follow
+        descriptor, so the link is refused and nothing is written through it."""
+        real_cache = Path.home() / ".aws" / "sso" / "cache"
+        real_cache.mkdir(parents=True)
+        (real_cache / "kiro-auth-token.json").write_text('{"accessToken": "real"}')
+
+        exfil = tmp_path / "agent-readable"
+        exfil.mkdir()
+        os_home = tmp_path / "os-home"
+        os_home.symlink_to(exfil, target_is_directory=True)
+
+        rt._seed_pod_os_home(os_home)  # must not raise
+
+        assert not list(exfil.rglob("kiro-auth-token.json")), (
+            "host SSO token was copied through a planted symlink into an "
+            "agent-readable directory"
+        )
+
+    @requires_posix_pod_lifecycle
+    def test_refuses_a_link_planted_at_an_inner_component(self, tmp_path: Path) -> None:
+        """An ancestor link is the harder case: O_NOFOLLOW on the final
+        component alone would still follow a link at `.aws`."""
+        real_cache = Path.home() / ".aws" / "sso" / "cache"
+        real_cache.mkdir(parents=True)
+        (real_cache / "kiro-auth-token.json").write_text('{"accessToken": "real"}')
+
+        exfil = tmp_path / "agent-readable"
+        exfil.mkdir()
+        os_home = tmp_path / "os-home"
+        os_home.mkdir()
+        (os_home / ".aws").symlink_to(exfil, target_is_directory=True)
+
+        rt._seed_pod_os_home(os_home)  # must not raise
+
+        assert not list(exfil.rglob("kiro-auth-token.json"))
+
+
 class TestCleanupHome:
     def test_removes_pod_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
@@ -3784,6 +3943,19 @@ class TestReviewRound1Fixes:
         assert "WECOM_SECRET" not in env
         assert "TELEGRAM_BOT_TOKEN" not in env  # non-AWS *_TOKEN
         assert env.get("AWS_SESSION_TOKEN") == "sts-temp"  # AWS kept
+
+    def test_build_pod_env_scopes_oauth_grant_reads_to_the_pod(
+        self, cfg: PodConfig, tmp_path: Path
+    ) -> None:
+        """KIROCREW_OS_HOME is what makes the pod's OWN mcp_grant reads (mint,
+        status, disconnect, mcp_discovery) resolve the pod's tree instead of the
+        real host's ``~/.aws/sso/cache`` -- see mcp_grant.kiro_oauth_cache_dir's
+        docstring for the split this closes."""
+        home = tmp_path / "home"
+        env = rt.build_pod_env(cfg, home, 7999, tmp_path / "co")
+        assert env["KIROCREW_OS_HOME"] == str(home / "os-home")
+        # Reclaimed by cleanup_home alongside everything else under home_dir.
+        assert Path(env["KIROCREW_OS_HOME"]).is_relative_to(home)
 
     def test_seed_forces_feishu_off(self, tmp_path: Path) -> None:
         """A seed cloned from a real home must not boot a live Feishu bot.

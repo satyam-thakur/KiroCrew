@@ -2037,11 +2037,28 @@ def build_pod_env(cfg: PodConfig, home_dir: Path, port: int, checkout: Path) -> 
     creds) survives intact — scrubbing it would leave half a credential and break
     every AWS call. Config-level channel enables are additionally forced off by
     ``sanitized_seed_config`` (defense-in-depth).
+
+    ``KIROCREW_OS_HOME`` points the pod's own :mod:`kiro_crew.mcp_grant` reads
+    (mint, status, disconnect, mcp_discovery's remote probe -- all resolved
+    through ``config.paths.kiro_oauth_cache_home``) at a dedicated
+    ``<home_dir>/os-home`` tree INSTEAD of the real host home. Without this a
+    pod's gateway process stats and unlinks MCP OAuth grant artifacts under the
+    REAL ``~/.aws/sso/cache`` -- so a Connections card in the pod reads
+    "Connected" from a grant the operator minted on the real machine, and a
+    grant minted inside the pod is a real, durable machine-level credential
+    that OUTLIVES ``pod down``. This directory is nested INSIDE ``home_dir`` so
+    ``cleanup_home``'s teardown reclaims it with everything else. It holds no
+    secret by itself -- see ``_seed_pod_os_home`` for what is staged into it,
+    and ``acp/client.py`` / ``acp/runtime.py`` for the matching ``HOME`` remap
+    on the pod's OWN kiro-cli children, which is what makes kiro-cli's writes
+    land in this same tree.
     """
+    os_home = home_dir / "os-home"
     env = {
         **os.environ,
         "HOME": os.environ.get("HOME", str(Path.home())),
         "KIROCREW_HOME": str(home_dir),
+        "KIROCREW_OS_HOME": str(os_home),
         "KIROCREW_PORT": str(port),
         "KIROCREW_PROJECT_DIR": str(checkout),
         # Declare pod identity. A pod is ephemeral by construction — `pod down`
@@ -2136,6 +2153,111 @@ def write_pod_config(home_dir: Path, seed: str) -> None:
         json.dumps(cfg_data, indent=2),
         restrict_to_owner=True,
     )
+
+
+# Glob for kiro-cli's single-file AWS SSO tokens under ``.aws/sso/cache`` --
+# deliberately NOT ``*.json``, which would also match the two-file
+# ``<sha256>.token.json`` / ``<sha256>.registration.json`` MCP OAuth grant
+# pairs :mod:`kiro_crew.mcp_grant` owns. Those pairs are per-server CREDENTIALS
+# a Connect click mints; copying one forward would let a pod boot already
+# "Connected" to a provider nobody consented to from inside it, and copying one
+# back at teardown would leave a real grant on the host after the pod that
+# minted it is gone. The SSO token filenames kiro-cli writes are fixed
+# (``kiro-auth-token.json`` for the IDE-flow token, `-cli` for the CLI-flow
+# one); the glob covers any future sibling with the same fixed prefix without
+# widening to catch the grant pairs, whose names are a computed sha256 with no
+# shared prefix.
+_SSO_TOKEN_GLOB = "kiro-auth-token*.json"
+
+
+def _seed_pod_os_home(os_home: Path) -> None:
+    """Create-only: seed *os_home*'s ``.aws/sso/cache`` from the REAL host's.
+
+    This is what lets ``kiro-cli login`` sign in ONCE on the operator's real
+    machine and have every pod reuse that sign-in, while a pod's own MCP OAuth
+    grants stay confined to ``os_home`` -- see ``build_pod_env``'s
+    ``KIROCREW_OS_HOME`` docstring for the split this closes. Only the
+    single-file SSO tokens matching :data:`_SSO_TOKEN_GLOB` are copied; the
+    glob's own docstring is why the two-file MCP grant pairs never match it.
+
+    **Every component is created and opened through a PINNED no-follow
+    descriptor, never by name.** This function copies a HOST credential into a
+    tree under the pod root, and it runs again on every boot -- so a name-based
+    ``mkdir(parents=True)`` plus a by-name write would follow a symlink planted
+    at ``os-home`` (or at any component beneath it) and deposit the operator's
+    SSO token wherever that link pointed, including an agent-readable workspace.
+    ``pinned_fs.create_and_open_dir_pinned`` refuses a link at the component it
+    creates and pins the parent chain first, and ``pinned_fs.copy_file_pinned``
+    validates the descriptor it copies rather than the name, so the inode
+    written is the inode checked. This is the same discipline
+    ``seed_home_from_scenario`` in this module already applies to a seeded home.
+
+    Create-only and per-file: ``skip_existing`` leaves an existing destination
+    untouched (a pod that already signed in, or already refreshed its own token,
+    is not clobbered), and a missing or unreadable source token is skipped
+    rather than aborting the whole pod boot -- a signed-out host still boots a
+    pod that can prompt for sign-in inside it, which is strictly better than
+    refusing to boot at all. The staged token is forced to ``0o600`` and every
+    directory to ``0o700``, so a token never lands world-readable even if the
+    source file's own mode is looser.
+    """
+    real_cache_dir = Path.home() / ".aws" / "sso" / "cache"
+    if not pinned_fs.supports_pinned_walk():
+        # No O_DIRECTORY/O_NOFOLLOW on this platform (Windows), so the tree
+        # cannot be built through pinned no-follow descriptors. Refuse to seed
+        # rather than fall back to a by-name copy: this moves a HOST credential,
+        # and an unpinned write is exactly the symlink-redirect the pinning
+        # exists to prevent. Pods are systemd --user (Linux) only, so no
+        # supported platform loses seeding; the pod would boot signed-out.
+        print("kirocrew-pod: OS-home seeding needs pinned descriptors; skipping (boots signed out)")
+        return
+    fds: list[int] = []
+    try:
+        # Each level is created through its PINNED parent, so a link planted at
+        # any component is refused instead of followed. Passing the full path
+        # per level is deliberate: create_and_open_dir_pinned pins the whole
+        # ancestor chain itself and creates only the final component.
+        target = os_home
+        for label in ("os-home", ".aws", "sso", "cache"):
+            if label != "os-home":
+                target = target / label
+            fds.append(
+                pinned_fs.create_and_open_dir_pinned(
+                    target, what=f"pod OS home {label}", refusal=PodError
+                )
+            )
+            os.fchmod(fds[-1], stat.S_IRWXU)
+        cache_fd = fds[-1]
+        try:
+            src_fd = pinned_fs.open_dir_pinned(
+                real_cache_dir, what="host SSO token cache", refusal=PodError
+            )
+        except (OSError, PodError):
+            # No readable host SSO cache (signed out, permission error, stalled
+            # mount): the pod still boots signed-out rather than not at all.
+            return
+        fds.append(src_fd)
+        for source in sorted(real_cache_dir.glob(_SSO_TOKEN_GLOB)):
+            try:
+                pinned_fs.copy_file_pinned(
+                    str(source),
+                    dir_fd=src_fd,
+                    name=source.name,
+                    dst_dir_fd=cache_fd,
+                    dst_name=source.name,
+                    skip_existing=True,
+                    force_mode=0o600,
+                )
+            except OSError:
+                continue
+    except (OSError, PodError):
+        # Seeding is best-effort for the same reason the unreadable-cache branch
+        # above is: a pod that cannot be pre-signed-in still boots and signs in
+        # from inside. A REFUSED component (a planted link) lands here too,
+        # which is the safe outcome -- nothing was written through it.
+        print(f"kirocrew-pod: OS-home seeding skipped for {os_home} (pod boots signed out)")
+    finally:
+        pinned_fs.close_all(fds)
 
 
 def cleanup_home(cfg: PodConfig, name: str) -> int:
@@ -2541,6 +2663,12 @@ def boot(cfg: PodConfig, name: str) -> int:
         # descriptor before their completion marker is published. Directory
         # seeds keep the existing config-only path.
         write_pod_config(home_dir, seed)
+    # Independent of the scenario/directory-seed split above: every pod, seeded
+    # or blank, gets its own OAuth-grant-cache home seeded from the real host's
+    # SSO tokens (see ``_seed_pod_os_home`` and ``build_pod_env``'s
+    # ``KIROCREW_OS_HOME`` docstring). Create-only per file, so re-running boot
+    # against an already-seeded home is a no-op.
+    _seed_pod_os_home(home_dir / "os-home")
 
     print(f"kirocrew-pod: name={name} port={port} home={home_dir} checkout={checkout}")
 
