@@ -359,7 +359,21 @@ export function evaluateAutoPin(args: {
   // Idle: release rather than merely skip the pin. Skipping would leave follow
   // armed, so the next turn to start would yank this reader to the bottom from
   // wherever they had settled — the same defect one event later.
+  //
+  // But distance alone cannot say WHO opened that gap, and the two causes want
+  // opposite answers: a reader who scrolled up should be released, while a
+  // reader the CONTENT moved away from should be carried back.
   if (!runActive && distanceFromBottom(geom) > atBottomEpsilon()) {
+    // Still resting exactly on our own last write: this reader provably did not
+    // move, so the bottom moved away from them — a tail image or widget
+    // finishing late, a spacer reprice, a prepended page repriced from estimates
+    // to measured truth. Correcting our own drift is not a yank, and releasing
+    // here is what strands a reader who was following: nothing re-arms `stick`
+    // without a genuine downward scroll, which a reader already at the bottom
+    // has no room to make.
+    if (lastWriteTop >= 0 && Math.abs(geom.scrollTop - lastWriteTop) <= epsilon) {
+      return { pin: true, stick: true, target }
+    }
     return { pin: false, stick: false, target }
   }
   // Release only on a genuine user scroll-UP: scrollTop dropped below our last

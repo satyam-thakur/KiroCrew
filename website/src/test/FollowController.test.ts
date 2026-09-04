@@ -217,7 +217,7 @@ describe('evaluateAutoPin — the race-proof core', () => {
     expect(r).toEqual({ pin: false, stick: false, target: 600 })
   })
 
-  it('IDLE: releases a reader sitting above the bottom instead of pinning them', () => {
+  it('IDLE: releases a reader who SCROLLED UP, instead of pinning them', () => {
     // Follow means "keep me at the end of a LIVE turn". With nothing running
     // there is no output to follow, so a reader 120px up is not following — and
     // pinning them is a spring-back with no cause (reported from a phone after
@@ -225,12 +225,30 @@ describe('evaluateAutoPin — the race-proof core', () => {
     // rather than merely skipping matters: leaving follow armed would hand the
     // yank to whichever turn starts next.
     //
-    // `lastWriteTop` EQUALS scrollTop on purpose, so the pre-existing
-    // scroll-up release cannot fire and this pins the idle rule alone: the gap
-    // opened because content grew below the fold, not because anyone scrolled.
+    // `lastWriteTop` is the BOTTOM our last pin wrote, and `scrollTop` is below
+    // it: that difference is the reader's own hand, which is what makes this the
+    // release case. (Encoding it with `lastWriteTop === scrollTop` instead would
+    // describe a reader who never moved — the opposite case, below.)
     const up = { scrollTop: 480, scrollHeight: 1000, clientHeight: 400 } // 120px above bottom
-    const r = evaluateAutoPin({ stick: true, geom: up, lastWriteTop: 480, runActive: false })
+    const r = evaluateAutoPin({ stick: true, geom: up, lastWriteTop: 600, runActive: false })
     expect(r).toEqual({ pin: false, stick: false, target: 600 })
+  })
+
+  it('IDLE: carries a reader the CONTENT moved away from back to the bottom', () => {
+    // Same geometry as the release case above and the opposite answer, because
+    // the only thing that differs is who opened the gap. `scrollTop` is still
+    // exactly where our last pin put it, so this reader provably did not move:
+    // the bottom moved away from them — a tail image or widget finishing late, a
+    // spacer reprice, a prepended page repriced from estimates to measured truth.
+    //
+    // Releasing here is what strands a reader who was following, and the strand
+    // is permanent: nothing re-arms `stick` without a genuine downward scroll,
+    // which a reader already at the bottom has no room to make. Reported as
+    // returning to a chat and not being at the bottom, and as follow sometimes
+    // not happening while parked there.
+    const drifted = { scrollTop: 480, scrollHeight: 1000, clientHeight: 400 }
+    const r = evaluateAutoPin({ stick: true, geom: drifted, lastWriteTop: 480, runActive: false })
+    expect(r).toEqual({ pin: true, stick: true, target: 600 })
   })
 
   it('IDLE: a reader ALREADY at the bottom keeps following', () => {
