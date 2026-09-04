@@ -11,6 +11,7 @@ from kiro_crew.messaging.renderer import display_safe
 from kiro_crew.messaging.session_resume import ResumeReleaseError  # noqa: F401  (re-export)
 from kiro_crew.messaging.session_resume import (
     PICKER_LIMIT,
+    SETTLE_NOTHING,
     InboundResolution,
     ResumeCopy,
     RoutingDecision,
@@ -175,8 +176,26 @@ class _TelegramResumeSurface:
         )
 
 
+def _decision_says_anything(decision: RoutingDecision) -> bool:
+    """Whether the binder produced anything beyond "run natively, nothing owed".
+
+    Enumerated rather than compared against a pristine ``RoutingDecision``, so a
+    field added later is a visible edit here instead of silently reading as empty.
+    ``observed`` is excluded on purpose: it is the live map state this side already
+    holds, not something the binder disclosed.
+    """
+    return bool(
+        decision.resumed_key is not None
+        or decision.refusal is not None
+        or decision.settle != SETTLE_NOTHING
+        or decision.described is not None
+        or decision.adopt_key
+        or decision.adopt_title
+    )
+
+
 class TelegramSessionResume:
-    """List dashboard sessions and bind one to a Telegram chat or Topic."""
+    """List dashboard sessions and bind one to the single operator's private DM."""
 
     def __init__(
         self,
@@ -240,15 +259,29 @@ class TelegramSessionResume:
     ) -> RoutingDecision:
         link = self.link_for(chat_id, thread_id)
         resolution = self._binder.resolve_inbound(link)
-        if (resolution.key is not None or resolution.ambiguous) and not self.is_owner(
-            user_id, chat_id, chat_type
-        ):
+        owner = self.is_owner(user_id, chat_id, chat_type)
+        if (resolution.key is not None or resolution.ambiguous) and not owner:
             return RoutingDecision(refusal=_ROUTE_OWNER_REFUSAL, observed=resolution)
-        return await self._binder.route(
+        decision = await self._binder.route(
             self.expectation_id(chat_id, thread_id),
             link,
             self._title_of,
         )
+        # The live-binding check above cannot stand alone: the binder ALSO answers
+        # from the durable expectation store, so a binding that was detached while
+        # its expectation survives resolves no key and no ambiguity, yet still
+        # produces a notice built from the dashboard session's TITLE. Reached by a
+        # non-owner — a single-owner binding detached, then a multi-user allow-list
+        # configured — that notice discloses host-wide history to someone the
+        # single-owner rule exists to exclude.
+        #
+        # So a non-owner gets the generic refusal for ANY non-empty decision, which
+        # names nothing. Deliberately including a settlement obligation: it stays
+        # OWED rather than being acknowledged by a message that was never
+        # delivered, so the owner still receives it.
+        if not owner and _decision_says_anything(decision):
+            return RoutingDecision(refusal=_ROUTE_OWNER_REFUSAL, observed=resolution)
+        return decision
 
     async def settle(
         self,

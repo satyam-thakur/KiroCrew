@@ -859,6 +859,30 @@ class SessionResumeController:
                 await surface.settle_picker(message_id, conflict)
                 return None
 
+            # Snapshot what this pick is about to overwrite. ``record`` replaces the
+            # channel's expectation outright, so on a failed bind, retiring the
+            # replacement is not a rollback: it leaves a DETACHED marker where an
+            # ACTIVE record used to be, and that record was the evidence a lost
+            # link owes the user a notice. The next message would then route
+            # natively and the notice would never be delivered.
+            #
+            # Guarded for the same reason the ``record`` call below is: the choice
+            # has already been CONSUMED from the picker registry, so an escaping
+            # store error would discard the press with no reply at all and leave
+            # the button dead. A store this read cannot parse is also one the
+            # write could not have trusted, so it settles fail-closed.
+            try:
+                prior = await self.binder.expectations.get(surface.expectation_id)
+            except Exception:
+                logger.warning(
+                    "%s resume: could not read the expectation store for %s",
+                    self.channel_type,
+                    choice.key,
+                    exc_info=True,
+                )
+                await surface.settle_picker(message_id, surface.choice_expectation_failed)
+                return None
+
             try:
                 expectation = await self.binder.expectations.record(
                     surface.expectation_id,
@@ -879,13 +903,32 @@ class SessionResumeController:
                 return None
 
             async def retire_failed_expectation() -> None:
+                """Undo this pick's expectation write, restoring what it displaced.
+
+                Compare-and-set on the replacement's own version throughout, so a
+                newer picker or dashboard record that landed meanwhile wins instead
+                of being reverted to this pick's view.
+                """
                 try:
-                    await self.binder.expectations.retire_if(
-                        surface.expectation_id, expectation.version
-                    )
+                    if prior is not None and not prior.retired:
+                        # An ACTIVE record was displaced: put it back, so the
+                        # refusal or adopt notice it owed is still owed.
+                        await self.binder.expectations.record_if(
+                            surface.expectation_id,
+                            expectation.version,
+                            prior.key,
+                            prior.title,
+                        )
+                    else:
+                        # Nothing meaningful to restore — no record, or an already
+                        # detached one. A retired marker is the same "detached"
+                        # state either way, so retiring is the faithful undo.
+                        await self.binder.expectations.retire_if(
+                            surface.expectation_id, expectation.version
+                        )
                 except Exception:
                     logger.warning(
-                        "%s resume: could not retire failed expectation for %s",
+                        "%s resume: could not undo failed expectation for %s",
                         self.channel_type,
                         choice.key,
                         exc_info=True,
