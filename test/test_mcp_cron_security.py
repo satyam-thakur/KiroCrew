@@ -447,6 +447,257 @@ def test_vet_script_contents_allows_benign(body):
     assert _vet_script_contents(body) is None
 
 
+# A script body is PYTHON SOURCE, not a shell command line. The execution-model
+# passes inside `is_sensitive_bash_command` (native-shell entry scan, the
+# alt-traversal pipeline walk, the `find` delivery analysis) model what a shell
+# would DO with the text — but a source file's stage count is its LINE count, so
+# every body past ~512 statements exhausted the pipeline walk's fail-closed
+# budget by construction and was refused at every fire, forever ("command has
+# more pipeline stages than this gate inspects"). The vet now scans script
+# bodies with `_subject_is_shell_grammar=False`, which skips the execution-model
+# passes and keeps every text-evidence pass on for the whole body.
+LONG_BENIGN_SCRIPT = (
+    "def run(ctx):\n"
+    + "".join(f"    x{i} = {i}\n" for i in range(600))
+    + "    ctx.notify('done')\n"
+)
+
+
+def test_vet_script_contents_allows_a_long_python_body():
+    """Red before the fix: the stage-budget refusal fired on line count alone."""
+    assert _vet_script_contents(LONG_BENIGN_SCRIPT) is None
+
+
+def test_vet_script_contents_still_blocks_credentials_in_a_long_body():
+    """Length must not dilute the full-text scans: the credential-path detector
+    reads the whole body regardless of how many stages the traversal walk saw.
+    """
+    body = LONG_BENIGN_SCRIPT + "data = open('/home/u/.aws/credentials').read()\n"
+    err = _vet_script_contents(body)
+    assert err is not None and err.startswith("Error:")
+
+
+def test_vet_script_contents_still_blocks_secret_env_in_a_long_body():
+    body = LONG_BENIGN_SCRIPT + "import os\nt = os.getenv('SLACK_BOT_TOKEN')\n"
+    err = _vet_script_contents(body)
+    assert err is not None and err.startswith("Error:")
+
+
+# A shell payload embedded in Python lives in a STRING LITERAL, and Python
+# quoting swallowed it from the raw-text scan: on the pre-split code,
+# is_sensitive_bash_command over the whole body returned None for every case
+# below (measured), so these pin a hole the literal scan CLOSES, not parity
+# with old behavior. Each literal is fed back through the full gate at the
+# default (shell) subject, where `rg 'AKIA' ~` is a recursive traversal rooted
+# at a directory holding credential paths -- reachable, because script crons run
+# in the `standard` sandbox, which deliberately leaves ~/.aws and ~/.ssh
+# readable.
+SHELL_PAYLOAD_SCRIPTS = [
+    # The reviewer's vector: payload in a multiline literal, run via shell=True.
+    "import subprocess\n"
+    'CMD = """rg \'AKIA\' ~"""\n'
+    "subprocess.run(CMD, shell=True)\n",
+    # Payload literal directly at the call site.
+    "import subprocess\nsubprocess.run(\"rg 'AKIA' ~\", shell=True)\n",
+    # os.system spelling.
+    "import os\nos.system(\"grep -r AKIA ~\")\n",
+    # The literal exists but never visibly flows to a shell call -- still
+    # refused: the scan judges literals, not dataflow, so hiding the call
+    # behind getattr()/aliasing does not exonerate the payload.
+    "PAYLOAD = \"rg 'AKIA' ~\"\nprint('nothing to see')\n",
+]
+
+
+@pytest.mark.parametrize("body", SHELL_PAYLOAD_SCRIPTS)
+def test_vet_script_contents_blocks_shell_payload_literals(body):
+    err = _vet_script_contents(body)
+    assert err is not None and err.startswith("Error:"), body
+    assert "string literal" in err
+
+
+def test_vet_script_contents_blocks_a_payload_literal_in_a_long_body():
+    """Length must not dilute the literal scan either."""
+    body = LONG_BENIGN_SCRIPT + "CMD = \"rg 'AKIA' ~\"\n"
+    err = _vet_script_contents(body)
+    assert err is not None and "string literal" in err
+
+
+def test_vet_script_contents_does_not_scan_docstrings_as_shell():
+    """Docstrings are prose, and the shell modeling fabricates on prose.
+
+    Measured on 23 real cron scripts: 3 docstrings drew traversal verdicts from
+    sentences like "Find commits on main...", while 3,700+ non-docstring
+    literals drew zero. The path that would EXECUTE a docstring --
+    ``subprocess.run(__doc__, shell=True)`` -- is closed by the dynamic-sink
+    rule (below), not by scanning the prose: a sink's command must be a plain
+    string literal, and ``__doc__`` is not one.
+    """
+    body = (
+        '"""Find commits on main that belong to no pull request.\n\n'
+        "A commit whose message names no PR is delivered to the operator.\n"
+        '"""\n'
+        "def run(ctx):\n"
+        '    """Find and deliver a match to a command channel."""\n'
+        "    ctx.notify('ok')\n"
+    )
+    assert _vet_script_contents(body) is None
+
+
+# A command COMPOSED at runtime reaches a shell sink with no individually
+# blocking literal, so the sink itself is gated: os.system / subprocess with
+# shell=True must take a PLAIN STRING LITERAL (which the literal scan already
+# judged) or the script is refused. Every vector below carries no blocking
+# literal -- the payload only exists assembled.
+DYNAMIC_SHELL_SINK_SCRIPTS = [
+    # The verifier's __doc__ vector: the excluded docstring becomes executable.
+    '"""rg AKIA in the home directory, recursively."""\n'
+    "import subprocess\n"
+    "subprocess.run(__doc__, shell=True)\n",
+    # Concatenated fragments.
+    "import subprocess\n"
+    'verb = "rg "\n'
+    "tail = \"'AKIA' ~\"\n"
+    "subprocess.run(verb + tail, shell=True)\n",
+    # f-string composition.
+    "import subprocess\n"
+    'pat = "AKIA"\n'
+    "subprocess.run(f\"rg '{pat}' ~\", shell=True)\n",
+    # A variable at the sink -- refused even when the literal it carries is
+    # benign, because what a NAME holds at runtime is not statically readable
+    # (one indirection re-opens the concat vector otherwise). The error tells
+    # the author the two accepted shapes.
+    "import subprocess\n"
+    'CMD = "echo hi"\n'
+    "subprocess.run(CMD, shell=True)\n",
+    # os.system with a composed command.
+    "import os\n"
+    'home = "~"\n'
+    'os.system("grep -r AKIA " + home)\n',
+    # os.system's own keyword spelling -- `command=`, not `args=`.
+    "import os\n"
+    '"""payload docstring"""\n'
+    "os.system(command=__doc__)\n",
+    # shell= smuggled through a **kwargs unpacking: no explicit shell keyword
+    # exists on the call, so an unpacked run-family call fails closed.
+    "import subprocess\n"
+    'verb = "rg "\n'
+    "tail = \"'AKIA' ~\"\n"
+    'subprocess.run(args=verb + tail, **{"shell": True})\n',
+    # The command itself hidden in the unpacking.
+    "import subprocess\n"
+    'p = "x"\n'
+    'subprocess.run(shell=True, **{"args": p})\n',
+    # Module-alias spelling is still recognized.
+    "import subprocess as sp\n"
+    'c = "x"\n'
+    "sp.run(c, shell=True)\n",
+    # from-import spelling is still recognized.
+    "from subprocess import run\n"
+    'c = "x"\n'
+    "run(c, shell=True)\n",
+    # `shell` reached POSITIONALLY: it is Popen's 9th parameter, and the
+    # run-family forwards positionals to Popen -- no shell= keyword appears.
+    "import subprocess\n"
+    'verb = "rg "\n'
+    "tail = \"'AKIA' ~\"\n"
+    "subprocess.Popen(verb + tail, -1, None, None, None, None, None, True, True)\n",
+    "import subprocess\n"
+    'verb = "rg "\n'
+    "tail = \"'AKIA' ~\"\n"
+    "subprocess.run(verb + tail, -1, None, None, None, None, None, True, True)\n",
+    # *starred positional unpacking puts every argument at an unknowable
+    # position, so the call fails closed.
+    "import subprocess\n"
+    "argv = ['whatever']\n"
+    "subprocess.Popen(*argv, shell=True)\n",
+    "import subprocess\n"
+    "everything = ['cmd', -1, None, None, None, None, None, True, True]\n"
+    "subprocess.Popen(*everything)\n",
+]
+
+
+@pytest.mark.parametrize("body", DYNAMIC_SHELL_SINK_SCRIPTS)
+def test_vet_script_contents_blocks_dynamic_shell_sinks(body):
+    err = _vet_script_contents(body)
+    assert err is not None and err.startswith("Error:"), body
+    assert "statically vetted" in err
+
+
+# Sink recognition is module-qualified, so an unrelated method that merely
+# shares a sink's NAME is never a sink -- rejecting these at registration (and
+# again at every fire) would be the same permanent-false-positive class this
+# PR exists to remove.
+NOT_SHELL_SINK_SCRIPTS = [
+    "class R:\n    def run(self, job, **kw):\n        return job\n"
+    "renderer = R()\n"
+    "theme = 'dark'\n"
+    "renderer.run('job', shell=theme)\n",
+    "class C:\n    def system(self, payload):\n        return payload\n"
+    "client = C()\n"
+    "data = {'a': 1}\n"
+    "client.system(data)\n",
+    # A local function named like a sink, not imported from os/subprocess.
+    "def run(cmd, shell=False):\n    return cmd\n"
+    "x = ['a']\n"
+    "run(x, shell=True)\n",
+]
+
+
+@pytest.mark.parametrize("body", NOT_SHELL_SINK_SCRIPTS)
+def test_vet_script_contents_module_qualifies_sink_recognition(body):
+    assert _vet_script_contents(body) is None, body
+
+
+def test_vet_script_contents_allows_literal_shell_sinks_and_argv_lists():
+    """The two shapes the sink rule's error message points authors at: a plain
+    literal command (already judged by the literal scan) and an argv list
+    without a shell. The argv-list residual is documented in the vet docstring:
+    no shell shape exists for any static pass to see, before or after this
+    change.
+    """
+    assert (
+        _vet_script_contents(
+            'import subprocess\nsubprocess.run("echo hi", shell=True)\n'
+        )
+        is None
+    )
+    assert (
+        _vet_script_contents(
+            "import subprocess\nsubprocess.run(['git', 'push'])\n"
+        )
+        is None
+    )
+    # Positional boundaries: shell as Popen's 9th positional literally False
+    # is not a sink; a literal command with positional shell True is a sink
+    # whose command the literal scan already judged.
+    assert (
+        _vet_script_contents(
+            "import subprocess\n"
+            "p = subprocess.Popen(['x'], -1, None, None, None, None, None, "
+            "True, False)\n"
+        )
+        is None
+    )
+    assert (
+        _vet_script_contents(
+            "import subprocess\n"
+            'subprocess.run("echo hi", -1, None, None, None, None, None, '
+            "True, True)\n"
+        )
+        is None
+    )
+
+
+def test_vet_script_contents_unparseable_body_keeps_the_raw_shell_scan():
+    """A body that is not Python yields no literals to judge, so it keeps the
+    whole-text scan WITH shell grammar -- never quietly exonerated. (It could
+    not run as a cron script anyway; the runner imports it as Python.)
+    """
+    body = "this is not python (\nrg 'AKIA' ~\n"
+    err = _vet_script_contents(body)
+    assert err is not None and err.startswith("Error:")
+
+
 # A cron script body is PYTHON SOURCE, not a shell command line. In Python source
 # a backslash run is an ESCAPE (`\\` is one backslash, `\.` is a literal dot), so
 # collapsing separator runs -- correct for a Win32 shell string, where

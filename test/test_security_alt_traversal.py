@@ -1090,6 +1090,77 @@ def test_an_ordinary_pipeline_is_nowhere_near_the_budget() -> None:
     assert len(stages) < security._ALT_MAX_STAGES
 
 
+def test_a_source_body_past_the_stage_budget_is_not_refused_for_length() -> None:
+    """A script FILE's stage count is its line count, so the fail-closed stage
+    cap -- right for a command line, where the uninspected suffix is executable
+    -- refused every long legitimate script, forever. The source-body subject
+    does not run the execution-model passes at all, so length alone can no
+    longer refuse.
+    """
+    body = "\n".join(f"x{i} = {i}" for i in range(security._ALT_MAX_STAGES + 100))
+    # The command-line default keeps its pinned refusal.
+    reason = is_sensitive_bash_command(body)
+    assert reason is not None and "pipeline stages" in reason
+    # The same text as a source body is clean: nothing in it names anything.
+    assert is_sensitive_bash_command(body, _subject_is_shell_grammar=False) is None
+
+
+def test_a_source_body_keeps_every_text_evidence_pass() -> None:
+    """The subject flag turns off the execution model, never the text evidence:
+    a body that NAMES a credential path is refused at any length.
+    """
+    padding = "\n".join(f"x{i} = {i}" for i in range(security._ALT_MAX_STAGES + 100))
+    body = f"{padding}\ndata = open('/home/u/.aws/credentials').read()"
+    reason = is_sensitive_bash_command(body, _subject_is_shell_grammar=False)
+    assert reason is not None and "credential path" in reason
+
+
+def test_a_source_body_skips_the_execution_model_passes_by_design() -> None:
+    """The documented trade, recorded so it is explicit rather than implied.
+
+    A traversal SHAPE (a reader rooted above the fenced leaves, naming no leaf)
+    is judged only for a shell subject. For a source body the RAW TEXT is not
+    modeled: the text is never handed to a shell as a unit, and the modeling has
+    been observed to fabricate verdicts from cross-line fragments of ordinary
+    Python. The flag is safe only in composition with the caller's literal-level
+    scan (mcp_cron._shell_scannable_literals feeds each string literal back
+    through this function at the DEFAULT subject), which is what judges the
+    payloads a source body can actually hand to a shell — including traversals
+    reaching ~/.aws and ~/.ssh, which the standard-mode script sandbox
+    deliberately leaves readable. A body that NAMES a fenced leaf or credential
+    path is still refused by the text-evidence passes (previous test).
+    """
+    body = f"rg . {CREW}\n" + "\n".join(f"x{i} = {i}" for i in range(20))
+    # Judged as a command line: the traversal shape refuses.
+    assert is_sensitive_bash_command(body) is not None
+    # Judged as source: the raw text is not modeled (a LITERAL carrying the same
+    # payload is caught by the caller's literal scan -- pinned in
+    # test_mcp_cron_security.py).
+    assert is_sensitive_bash_command(body, _subject_is_shell_grammar=False) is None
+
+
+def test_a_source_body_env_credential_shapes_are_shell_grammar_only() -> None:
+    """The env-credential pass is regex-based but its shared rules are ordered
+    PIPELINE shapes (`dump .* | .* filter .* selector`). Over a source file `|`
+    is regex alternation, so the shape assembles from fragments of unrelated
+    lines: here `env = dict(os.environ)` plus a detection-regex literal reads
+    as `env | grep AWS_SECRET`. Benign scanner code -- exactly the script most
+    likely to name these patterns on purpose. Env-secret NAMING in a script
+    body stays covered by the cron vet's own full-text `_CRON_SECRET_ENV_RE` /
+    `_CRON_SECRET_NAME_RE` scans (pinned in test_mcp_cron_security.py), and
+    string literals come back through this pass at the shell subject.
+    """
+    body = (
+        "import os, re\n"
+        "env = dict(os.environ)\n"
+        'PAT = re.compile(r"(rm|del)|grep .*AWS_SECRET")\n'
+    )
+    # As a command line the assembled shape refuses (unchanged default).
+    assert is_sensitive_bash_command(body) is not None
+    # As source it is recognized as fragments, not a pipeline.
+    assert is_sensitive_bash_command(body, _subject_is_shell_grammar=False) is None
+
+
 @pytest.mark.parametrize(
     "command",
     [

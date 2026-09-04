@@ -9915,22 +9915,47 @@ def is_sensitive_bash_command(
        ``is_sensitive_path()`` to catch obfuscation (e.g. ``ca""t ~/.aws/credentials``,
        ``awk '{print}' $HOME/.ssh/id_rsa``, ``sed -n p ~/../../etc/shadow``).
 
-    Between them runs **pass 1b**, which repeats the pass-1 matchers over
-    separator-run-COLLAPSED copies of the subject. That is a Win32 *shell grammar*
-    heuristic: a shell opens the store ``%LOCALAPPDATA%\\kiro-cli`` names when
-    handed ``%LOCALAPPDATA%\\\\kiro-cli``, so the run carries no meaning and
-    collapsing it closes the doubled spelling (#6350).
+    ``_subject_is_shell_grammar`` says whether *command* is a shell COMMAND LINE
+    (the default) or a larger text — a source-code body — being scanned as
+    defense-in-depth. It keys every SHELL-GRAMMAR heuristic at once; a caller
+    either has shell grammar and gets all of them, or does not and gets none:
 
-    ``_subject_is_shell_grammar=False`` skips ONLY pass 1b, for a caller scanning a
-    subject that is not a shell command line -- a **source-code body**, where a
-    backslash run is an ESCAPE rather than a redundant separator. There ``\\\\`` is
-    one backslash and ``\\.`` is a literal dot, so collapsing strips the escapes and
-    manufactures a path the subject never contained: a ``re`` pattern that redacts a
-    fenced store, or a docstring merely naming one, reads as an access to it. Every
-    other pass still runs, so a source body keeps the path matcher, the extraction
-    control, the relative-traversal matcher, the normalizer, IMDS and env-credential
-    detection -- and its own caller keeps its ``is_sensitive_path`` check on the
-    resolved file path.
+    * **Pass 1b** (separator-run collapse) repeats the pass-1 matchers over
+      separator-run-COLLAPSED copies of the subject. That is a Win32 shell
+      heuristic: a shell opens the store ``%LOCALAPPDATA%\\kiro-cli`` names when
+      handed ``%LOCALAPPDATA%\\\\kiro-cli``, so the run carries no meaning and
+      collapsing it closes the doubled spelling (#6350). In SOURCE a backslash
+      run is an ESCAPE — ``\\\\`` is one backslash, ``\\.`` a literal dot — so
+      collapsing manufactures a path the subject never contained: a ``re``
+      pattern that redacts a fenced store reads as an access to it. A source
+      caller replaces this pass with the decoded-literal scan
+      (``is_sensitive_source_body``).
+    * **Passes 3-5 and the env-credential pipeline shapes** (native-shell
+      entry-then-read, the alt-traversal walk, the ``find`` delivery analysis,
+      ordered ``dump | filter`` shapes) read the text as one command line:
+      variable resolution across statements, ``cd`` state, pipeline delivery,
+      analysis budgets that refuse on exhaustion. Applied to source they judge
+      fiction — a 700-line Python file exceeds the pipeline walk's fail-closed
+      stage budget by line count alone, and the ``find`` pass has been observed
+      resolving cross-line fragments of ordinary Python into a fenced path the
+      file never names — each a permanent false positive, at every scan, on
+      legitimate source. Turning them off for a source body is safe ONLY in
+      composition with a literal-level scan by the caller: a shell payload
+      embedded in source lives in a string literal, and a literal IS
+      shell-grammar subject matter, so the caller extracts the literals and
+      feeds each one back through this function at the default subject (see
+      ``mcp_cron._shell_scannable_literals``).
+
+    The TEXT-EVIDENCE passes run for both subjects: the pass-1 regex fences,
+    the trust-root extraction control, the relative-traversal matcher, the
+    normalizer token scan, and IMDS all refuse only when the text itself names
+    something sensitive, which is as meaningful in source as in a command — and
+    a source caller keeps its own ``is_sensitive_path`` check on the resolved
+    file path. The runtime sandbox is a partial backstop, not the control:
+    script subprocesses get the crew-fenced leaves masked at every sandbox
+    level (``_CREW_HIDDEN_LEAVES``), but the ``standard`` mode they run under
+    deliberately leaves ``~/.aws``/``~/.ssh`` readable — which is exactly why
+    the literal scan is required.
 
     Returns denial reason string, or None if clean.
     """
@@ -9981,40 +10006,56 @@ def is_sensitive_bash_command(
     if normalizer_result:
         return normalizer_result
 
-    # ── Pass 3: native-shell entry-then-relative-read scan ──
-    native_result = _check_native_home_entry_then_fenced_read(command)
-    if native_result:
-        return native_result
+    # ── Passes 3-5 model shell EXECUTION, so they run only when the subject IS a
+    # shell command line. On a source file they resolve variables, `cd` state and
+    # pipeline delivery that no shell will ever perform on that text, and their
+    # fail-closed analysis budgets refuse on the file's sheer length — see the
+    # docstring. The text-evidence passes above and below run for every subject.
+    if _subject_is_shell_grammar:
+        # ── Pass 3: native-shell entry-then-relative-read scan ──
+        native_result = _check_native_home_entry_then_fenced_read(command)
+        if native_result:
+            return native_result
 
-    # ── Pass 4: alternate traversal tools rooted above a fenced path ──
-    alt_result = _check_alt_traversal_reaches_fence(command)
-    if alt_result:
-        return alt_result
+        # ── Pass 4: alternate traversal tools rooted above a fenced path ──
+        alt_result = _check_alt_traversal_reaches_fence(command)
+        if alt_result:
+            return alt_result
 
-    # ── Pass 5: a `find` traversal that DELIVERS a fenced match ──
-    # The passes above all judge a TOKEN. `find` factors the path across two
-    # arguments and produces it at runtime, so no token names it -- see the block
-    # comment on `_check_find_traversal_reaches_fence`. It judges every text this
-    # command runs as a shell, not just the outer line, so a traversal wrapped in a
-    # `-c` payload or a substitution is judged too.
-    #
-    # Pass 4 is the sibling of this one and the two are disjoint by construction: it
-    # answers the same question for every traversal program EXCEPT `find` (its own
-    # docstring says so), because `find` is the one whose filter grammar decides
-    # which paths the traversal even produces. Neither subsumes the other, so both
-    # run; being disjoint on the program word, their order does not matter.
-    find_result = _check_find_traversal_reaches_fence(command)
-    if find_result:
-        return find_result
+        # ── Pass 5: a `find` traversal that DELIVERS a fenced match ──
+        # The passes above all judge a TOKEN. `find` factors the path across two
+        # arguments and produces it at runtime, so no token names it -- see the block
+        # comment on `_check_find_traversal_reaches_fence`. It judges every text this
+        # command runs as a shell, not just the outer line, so a traversal wrapped in a
+        # `-c` payload or a substitution is judged too.
+        #
+        # Pass 4 is the sibling of this one and the two are disjoint by construction: it
+        # answers the same question for every traversal program EXCEPT `find` (its own
+        # docstring says so), because `find` is the one whose filter grammar decides
+        # which paths the traversal even produces. Neither subsumes the other, so both
+        # run; being disjoint on the program word, their order does not matter.
+        find_result = _check_find_traversal_reaches_fence(command)
+        if find_result:
+            return find_result
 
     # IMDS access via any IP encoding (decimal, hex, octal, IPv6-mapped)
     imds_result = _check_imds_access(command, enabled_ids=enabled_ids)
     if imds_result:
         return imds_result
-    # Environment credential exfiltration (declare -p, env|grep, printenv, etc.)
-    env_result = _check_env_credential_access(command)
-    if env_result:
-        return env_result
+    if _subject_is_shell_grammar:
+        # Environment credential exfiltration (declare -p, env|grep, printenv,
+        # etc.). Shell-grammar-only despite being regex-based: its shared rules
+        # are ordered PIPELINE shapes (`dump .* | .* filter .* selector`), and
+        # over a whole source file `|` is regex alternation and type-union
+        # syntax, so the shape assembles from fragments of unrelated lines.
+        # Measured: a security-audit cron whose own detection patterns name
+        # `/\.aws` drew this verdict from a regex literal plus a `|` hundreds
+        # of lines away. A source SUBJECT's env-secret naming is covered by the
+        # cron vet's own `_CRON_SECRET_ENV_RE`/`_CRON_SECRET_NAME_RE` full-text
+        # scans, and its literals come back through here at the shell subject.
+        env_result = _check_env_credential_access(command)
+        if env_result:
+            return env_result
     return None
 
 
@@ -10036,6 +10077,37 @@ def is_sensitive_source_body(text: str) -> str | None:
     if literal_reason:
         return literal_reason
     return is_sensitive_bash_command(text, _subject_is_shell_grammar=not parses)
+
+
+def is_shell_payload_literal(literal: str) -> str | None:
+    """The shell-EXECUTION verdict on ONE string literal from a source body.
+
+    The companion to :func:`is_sensitive_source_body`, owning the other half of
+    the source-subject split: that function answers the NAMING question for a
+    body and its literal VALUES (fence hits, with pattern-slot exoneration for
+    redactors), while this one answers the EXECUTION question for a literal —
+    is this text, handed to a shell, a traversal or credential-dump payload?
+    A literal is exactly the text a shell would receive, so the execution-model
+    analyses that judge fiction on raw source (see
+    ``is_sensitive_bash_command``'s subject flag) are sound here and only here.
+
+    Deliberately does NOT re-run the naming passes: they already ran, with
+    their exonerations, in ``is_sensitive_source_body`` — re-asking them here
+    would re-deny the redaction literals that scan deliberately allows (the
+    #7912 class). Callers pair this with that function, never use it alone.
+
+    Returns a denial reason, or None when clean.
+    """
+    native = _check_native_home_entry_then_fenced_read(literal)
+    if native:
+        return native
+    alt = _check_alt_traversal_reaches_fence(literal)
+    if alt:
+        return alt
+    find_result = _check_find_traversal_reaches_fence(literal)
+    if find_result:
+        return find_result
+    return _check_env_credential_access(literal)
 
 
 # `NAME=value` prefix. `normalize_shell_command` keeps it as a single token, and
