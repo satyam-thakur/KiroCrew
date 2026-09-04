@@ -432,6 +432,7 @@ class TranscriptReadProjection:
                 # (see the docstring). A healthy read skips these too, so this one
                 # must stay a plain skip.
                 continue
+            seg_rows: list[dict] = []
             for ln in lines[1:]:
                 if not ln.strip():
                     continue
@@ -451,7 +452,31 @@ class TranscriptReadProjection:
                 if "_type" not in row:
                     # `_type` rows are deliberate control records, not messages --
                     # skipping them IS the classification this corpus wants.
-                    rows.append(row)
+                    seg_rows.append(row)
+            # Rotation archives the live file's head BEFORE rewriting the live
+            # file. A hard crash between those two writes leaves the archived
+            # rows at the head of the live file too, so the NEXT rotation
+            # archives that same prefix again: segment N+1 then begins with
+            # segment N's tail. Merge each segment through the module's one
+            # identity rule so a rotate segment contributes only rows the
+            # corpus has not already accumulated -- this corpus is the index
+            # space pagination cursors and fork indices resolve against, and
+            # a duplicated row silently shifts every index above it. This
+            # covers segment-to-segment overlap only: the archive-to-live
+            # seam in read_messages_chained_full still needs its own
+            # drop_persisted_tail_prefix call.
+            merged = drop_persisted_tail_prefix(rows, seg_rows)
+            if len(merged) < len(seg_rows):
+                # A fired dedupe is the on-disk signature of a rotation that
+                # crashed inside the archive-to-rewrite window. Every other
+                # anomaly in this reader logs; dropping rows silently would
+                # make a genuine (mis)drop unattributable in the field.
+                _HISTORY_LOGGER.warning(
+                    "rotated segment %s overlaps the corpus: dropped %d duplicate row(s)",
+                    p.name,
+                    len(seg_rows) - len(merged),
+                )
+            rows.extend(merged)
         if complete:
             if not rows:
                 # Segments exist yet no rotate rows parsed — the exact signature

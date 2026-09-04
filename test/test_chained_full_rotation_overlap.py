@@ -121,3 +121,86 @@ def test_the_fork_flat_prepend_branch_is_also_guarded() -> None:
         "rotated head, or a crash-window duplication shifts every fork index"
     )
     assert "all_messages = _rotated_head + all_messages" not in body
+
+
+class TestSegmentBoundaryDedupe:
+    """The SAME crash window, one level down: segment N+1 vs segment N.
+
+    Rotation archives the live file's head BEFORE rewriting the live file, so a
+    hard crash between the two writes leaves the archived rows at the head of
+    the live file too — and the NEXT rotation archives that same prefix again.
+    ``read_rotated_messages`` used to concatenate segments blind, so the
+    duplicate was already inside ``rotated`` before the archive-to-live guard
+    ever ran. These pin that each segment is merged through
+    ``drop_persisted_tail_prefix`` at the segment boundary.
+    """
+
+    @staticmethod
+    def _projection(tmp_path):
+        import pathlib
+
+        from kiro_crew import history as history_mod
+        from kiro_crew.history_projection import TranscriptReadProjection
+
+        class _Log:
+            def __init__(self, d: pathlib.Path) -> None:
+                self._dir = pathlib.Path(d)
+
+        proj = TranscriptReadProjection.__new__(TranscriptReadProjection)
+        proj._log = _Log(tmp_path)  # type: ignore[attr-defined]
+        adir = pathlib.Path(history_mod._archive_dir(pathlib.Path(tmp_path)))
+        adir.mkdir(parents=True, exist_ok=True)
+        stem = history_mod._safe_key("slot-a") + history_mod.ARCHIVE_SEGMENT_DELIMITER
+        return proj, adir, stem
+
+    @staticmethod
+    def _segment(adir, stem: str, stamp: str, rows: list) -> None:
+        import json as _json
+
+        lines = [_json.dumps({"_type": "archive", "reason": "rotate"})]
+        lines += [_json.dumps(r) for r in rows]
+        (adir / f"{stem}{stamp}.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _read(self, proj) -> list:
+        from kiro_crew.history_projection import TranscriptReadProjection
+
+        return TranscriptReadProjection.read_rotated_messages(proj, "slot-a")
+
+    def test_overlapping_segments_serve_each_row_once(self, tmp_path) -> None:
+        # Segment N holds 1-3; the crash window re-archived its tail, so
+        # segment N+1 begins with 2,3 before continuing 4,5.
+        proj, adir, stem = self._projection(tmp_path)
+        self._segment(adir, stem, "20260101-000000", [_m("1"), _m("2"), _m("3")])
+        self._segment(adir, stem, "20260101-000100", [_m("2"), _m("3"), _m("4"), _m("5")])
+        mids = [r["meta"]["mid"] for r in self._read(proj)]
+        assert mids == ["1", "2", "3", "4", "5"], mids
+        assert len(mids) == len(set(mids)), f"a row is served twice: {mids}"
+
+    def test_partial_overlap_drops_only_the_shared_prefix(self, tmp_path) -> None:
+        # Segment N+1 begins with only PART of N's tail: the helper's contract
+        # is longest-prefix, so exactly that part goes, nothing more.
+        proj, adir, stem = self._projection(tmp_path)
+        self._segment(adir, stem, "20260101-000000", [_m("1"), _m("2"), _m("3")])
+        self._segment(adir, stem, "20260101-000100", [_m("3"), _m("4")])
+        mids = [r["meta"]["mid"] for r in self._read(proj)]
+        assert mids == ["1", "2", "3", "4"], mids
+
+    def test_non_overlapping_segments_lose_nothing(self, tmp_path) -> None:
+        # The normal case: a clean rotation pair. A dedupe that removed anything
+        # here would silently truncate the transcript head.
+        proj, adir, stem = self._projection(tmp_path)
+        self._segment(adir, stem, "20260101-000000", [_m("1"), _m("2")])
+        self._segment(adir, stem, "20260101-000100", [_m("3"), _m("4")])
+        mids = [r["meta"]["mid"] for r in self._read(proj)]
+        assert mids == ["1", "2", "3", "4"], mids
+
+    def test_the_deduped_corpus_is_what_gets_cached(self, tmp_path) -> None:
+        # The merge happens inside the cached region: a cache hit must serve the
+        # deduped rows, not a raw concatenation captured before the merge.
+        proj, adir, stem = self._projection(tmp_path)
+        self._segment(adir, stem, "20260101-000000", [_m("1"), _m("2")])
+        self._segment(adir, stem, "20260101-000100", [_m("2"), _m("3")])
+        first = self._read(proj)
+        cached = proj._rotated_cache["slot-a"][1]  # type: ignore[attr-defined]
+        assert [r["meta"]["mid"] for r in cached] == ["1", "2", "3"]
+        assert self._read(proj) == first
