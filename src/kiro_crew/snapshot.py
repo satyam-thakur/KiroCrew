@@ -2655,6 +2655,139 @@ def _merge_notifications(src_path: Path, dst_path: Path) -> None:
     print(f"  Notifications imported: {imported}")
 
 
+def _copy_notifications(src_path: Path, dst_path: Path) -> None:
+    """Install the snapshot's notification records where the live file does not exist yet.
+
+    The sibling of ``_merge_notifications``, and the reason it exists separately
+    is that the two branches of one ``if`` had different postures: the merge
+    validates every source record's encoding and ABORTS on one it cannot deliver
+    intact, while this branch was ``shutil.copy2`` and validated nothing. A
+    byte-exact copy is correct as a copy and that is exactly the problem -- it
+    faithfully installs bytes the destination's own reader refuses.
+    ``_load_notifications`` decodes the WHOLE file inside one ``try`` that
+    returns ``[]``, so one invalid byte costs every row, and the next
+    ``_rewrite_notifications`` -- any delete, ack or clear -- persists that empty
+    view. Unlike the merge this fired on every locale, because nothing decoded on
+    the way in, and it fired on a fresh install or a first restore, where the
+    operator has the least reason to suspect anything.
+
+    So the posture matches the merge: ABORT, never accept, never skip. That is not
+    a new product decision, it is the decision the merge branch already carries --
+    a snapshot with an undecodable record aborted the restore when a live file
+    existed and was installed silently when one did not.
+
+    It is a SEPARATE function rather than a call into the merge with an empty
+    destination, and both halves of that were measured, not assumed:
+
+    * ``_merge_notifications`` opens the destination for READ first, so a missing
+      one raises ``FileNotFoundError`` out of the arm that guarantees a
+      destination-scan failure is a true no-op. Teaching that arm to tell
+      "missing, fine" from "unreadable, abort" reopens the fail-closed posture
+      that arm exists for.
+    * The merge DEDUPLICATES against what it has already written, which a copy
+      must not: run four source records -- two sharing a ``ts``, two byte-identical
+      without one -- through a merge into an empty destination and two land. There
+      is nothing here to deduplicate against, so keying source records against
+      each other converts a faithful copy into a lossy one.
+
+    ONE pass over the source, validating and writing record by record, because a
+    scan followed by ``copy2`` is two passes over a file another process can
+    append to and a record landing between them is installed unvalidated. Every
+    record is written verbatim -- what is validated is the source's bytes, never a
+    decoded form of them -- with a single repair: an unterminated final record
+    gains a terminator. That is not cosmetic once the write is record-wise.
+    ``_persist_notification`` appends ``json.dumps(note) + "\\n"``, so the first
+    notification after the restore would otherwise glue onto an unterminated last
+    line and produce one line that parses as neither row. It is the same repair
+    the merge makes through ``dst_unterminated``.
+
+    TWO passes over the source, and the ordering is the whole design:
+
+    1. The ENTIRE source is validated first. This pass writes nothing, so the
+       defect this function exists for -- an archive carrying a record the live
+       reader refuses -- aborts with the destination never created. There is
+       nothing to roll back, which matters because there is no safe rollback: an
+       earlier revision created the live file and unlinked it on refusal, and
+       ``apply_import_zip`` runs inside the live gateway, so the dashboard's
+       notification sink could append to that file first and the unlink took the
+       operator's notification with it. Review's finding. Not creating the file is
+       the only version of that with no window at all.
+    2. The destination is then created ``O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW`` and
+       records are validated AGAIN as they are written, so only bytes that passed
+       the check ever land. ``O_EXCL`` decides inside one syscall, so a name that
+       filled after the caller's ``is_file()`` check is refused rather than
+       written through -- a dangling symlink at that name included, which
+       ``is_file()`` reports as absent and ``copy2`` followed, writing the
+       archive's bytes outside the data home.
+
+    No temporary file, deliberately, and this is the second review finding: a temp
+    file in the data home is published through a NAME, and a same-user process that
+    can list that directory can swap what the name holds between the write and the
+    publish -- which links bytes this function never validated into place as
+    ``notifications.jsonl``. The mitigations for that are inode verification on both
+    ends plus a non-hardlink fallback (``pinned_fs.put_back_no_clobber`` is the
+    repo's audited version, and its own docstring notes the landed check narrows the
+    window rather than closing it). Writing straight to an ``O_EXCL`` destination
+    needs none of it: there is no intermediate name to swap.
+
+    The residual is therefore a source that CHANGES between the two passes, and its
+    prefix stays -- the same residue ``_merge_notifications`` documents for its own
+    two-pass structure. It is bounded much more tightly here: the second pass
+    validates before each write, so a prefix is always a SHORT file of valid
+    records, never a poisoned one. A short notification history is recoverable from
+    the archive; an unloadable one is what this function exists to prevent.
+
+    Records are written verbatim -- what is validated is the source's bytes, never a
+    decoded form of them -- with a single repair: an unterminated final record gains
+    a terminator. That is not cosmetic once the write is record-wise.
+    ``_persist_notification`` appends ``json.dumps(note) + "\\n"``, so the first
+    notification after the restore would otherwise glue onto an unterminated last
+    line and produce one line that parses as neither row. It is the same repair the
+    merge makes through ``dst_unterminated``.
+    """
+    # Pass 1: validate everything, write nothing. `_notification_key`'s result is
+    # discarded -- it is called for the `UndecodableRecord` it raises, which its own
+    # docstring documents as how the encoding property is enforced. Reusing the
+    # merge's predicate rather than inlining a second decode is what keeps the two
+    # branches' acceptance criteria identical, and a second decode is exactly how
+    # they drifted apart in the first place.
+    try:
+        with open(src_path, "rb") as f:
+            for record in strict_raw_records(f, src_path, cap=_NOTIFICATION_RECORD_CAP):
+                _notification_key(record, src_path)
+    except (OSError, UnreadableRecord) as exc:
+        # `_safe_name` on the PATH because a bundle chooses its own inner root, so
+        # an archive-derived path can carry ANSI controls and printing one raw lets
+        # a hostile archive overwrite the lines right above the operator's prompt.
+        # The EXCEPTION does not need it, for the reason `_merge_notifications`
+        # states: both types this arm catches already render an embedded path with
+        # repr-style escaping.
+        print(f"  ⚠️  Could not copy {_safe_name(src_path)}: {exc} — notifications not imported")
+        raise
+    # 0o666 so the kernel applies the umask, giving the same mode as the `open(path,
+    # "a")` in `_persist_notification`: a restored file must not be tighter than one
+    # the product wrote itself.
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    written = 0
+    try:
+        with os.fdopen(os.open(dst_path, flags, 0o666), "wb") as out:
+            with open(src_path, "rb") as f:
+                for record in strict_raw_records(f, src_path, cap=_NOTIFICATION_RECORD_CAP):
+                    # Validated again, so the file only ever holds checked bytes and
+                    # an interrupted copy leaves a short VALID file, not a poison.
+                    _notification_key(record, src_path)
+                    out.write(record if record.endswith(_TERMINATORS) else record + b"\n")
+                    written += 1
+    except (OSError, UnreadableRecord) as exc:
+        # Reached only when the name filled after the caller's check (`FileExistsError`,
+        # nothing written) or the source changed between the passes. The prefix STAYS:
+        # every record in it passed validation, and unlinking is what took a concurrent
+        # writer's file in the revision review blocked. The count is named so an
+        # operator knows a short file landed.
+        print(f"  ⚠️  Could not copy {_safe_name(src_path)}: {exc} — {written} imported")
+        raise
+
+
 def _backup_and_copy(
     mc: Path,
     backup: Path,
@@ -3908,7 +4041,10 @@ def _do_merge(
             if dn.is_file():
                 _merge_notifications(sn, dn)
             else:
-                shutil.copy2(str(sn), str(dn))
+                # Not `copy2`: a byte-exact copy installs records the live file's
+                # own reader refuses, and that reader loses the whole file to one
+                # of them. Same abort posture as the merge branch above.
+                _copy_notifications(sn, dn)
                 print("  Notifications: copied")
         print("  ✅ notifications")
 

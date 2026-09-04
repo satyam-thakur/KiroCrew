@@ -1853,6 +1853,266 @@ class TestNotificationMergeWriteSideContract:
         assert dst.read_bytes() == self.LIVE, "the retry appended something"
 
 
+# ── Issue #8181: the copy branch installed unvalidated notification bytes ──────
+
+
+class TestNotificationCopyWhenNoLiveFileExists:
+    """The OTHER branch of the same ``if``, which validated nothing.
+
+    ``_merge_notifications`` runs when a live ``notifications.jsonl`` exists. When
+    one does not -- a fresh install, a first restore -- the restore took
+    ``shutil.copy2`` instead, so the same snapshot that ABORTED the restore in one
+    case was installed silently in the other. A byte-exact copy is correct as a
+    copy and that is the defect: it faithfully installs bytes the destination's own
+    reader refuses, and that reader loses the WHOLE file to one of them.
+
+    Every fixture is real bytes on a real file, for the reason the merge class
+    states: a synthesized ``UnicodeDecodeError`` routes the copy down a healthy
+    path and proves nothing. The undecodable record is measured as INSTALLED
+    without the fix -- ``strict_raw_records`` frames and bounds records but does
+    not decode, so framing alone reproduces ``copy2``'s behaviour exactly.
+    """
+
+    GOOD = b'{"ts":"2026-03-01T00:00:00Z","msg":"snap"}\n'
+    MORE = b'{"ts":"2026-03-02T00:00:00Z","msg":"snap2"}\n'
+    BAD_UTF8 = b'{"ts":"2026-03-03T00:00:00Z","msg":"\xff"}\n'
+
+    def _snap(self, tmp_path, src_bytes: bytes) -> tuple[Path, Path]:
+        """An extracted-snapshot staging dir and a data home with no live file."""
+        snap = tmp_path / "snap"
+        home = tmp_path / "home"
+        snap.mkdir(parents=True)
+        home.mkdir(parents=True)
+        (snap / "notifications.jsonl").write_bytes(src_bytes)
+        return snap, home
+
+    def _merge(self, snap: Path, home: Path) -> None:
+        """Drive the real restore, so the CALL SITE is under test, not the helper."""
+        snapshot_mod._do_merge(
+            snap, home, ["notifications"], allow_unpinned=bool(unpinnable_argv())
+        )
+
+    def test_an_undecodable_record_is_never_installed(self, tmp_path, capsys):
+        """The whole point, and it must reach the CALLER, not only stdout.
+
+        ``apply_import_zip`` appends ``notifications (copied)`` to its summary and
+        the dashboard handler answers ``ok: True``; neither sees a print. So the
+        posture is the merge branch's -- abort by raising -- and the success lines
+        must not be reached.
+        """
+        snap, home = self._snap(tmp_path, self.GOOD + self.BAD_UTF8)
+        with pytest.raises(UndecodableRecord):
+            self._merge(snap, home)
+        assert not (
+            home / "notifications.jsonl"
+        ).exists(), "a partially copied file was left where the reader will find it"
+        out = capsys.readouterr().out
+        assert "Notifications: copied" not in out, "reported success on a refused copy"
+        assert "✅ notifications" not in out
+        assert "not valid UTF-8" in out
+
+    def test_the_reader_loads_every_record_the_copy_installs(self, tmp_path, monkeypatch):
+        """The consequence, asserted through the reader that actually loses the file.
+
+        This is the test that separates a real fix from a no-op. Framing the
+        records without decoding them installs the bad byte just as ``copy2`` did,
+        and every byte-level assertion above still passes; only loading the
+        installed file through ``_load_notifications`` shows it. Measured on the
+        unfixed branch: 0 rows from a file holding 2 valid records, then the next
+        rewrite persists that empty view.
+        """
+        snap, home = self._snap(tmp_path, self.GOOD + self.MORE + self.BAD_UTF8)
+        monkeypatch.setenv("KIROCREW_HOME", str(home))
+        with pytest.raises(UndecodableRecord):
+            self._merge(snap, home)
+
+        # Same source without the bad record: the copy must be fully loadable.
+        clean, home2 = self._snap(tmp_path / "clean", self.GOOD + self.MORE)
+        monkeypatch.setenv("KIROCREW_HOME", str(home2))
+        self._merge(clean, home2)
+        from kiro_crew.dashboard import state as dashboard_state
+
+        assert len(dashboard_state._load_notifications()) == 2
+
+    def test_a_clean_source_is_copied_record_for_record(self, tmp_path):
+        """Byte-exactness is the property ``copy2`` had and the fix must keep.
+
+        A ``\\r\\n`` terminator survives and a bare ``\\r`` inside the file ends a
+        record without being rewritten -- the text-mode round trip that #7771
+        removed from the merge is not reintroduced here.
+        """
+        src_bytes = b'{"ts":"1","msg":"a"}\r\n{"ts":"2","msg":"b"}\r{"ts":"3","msg":"c"}\n'
+        snap, home = self._snap(tmp_path, src_bytes)
+        self._merge(snap, home)
+        assert (home / "notifications.jsonl").read_bytes() == src_bytes
+
+    def test_an_unterminated_final_record_gains_a_terminator(self, tmp_path):
+        """Otherwise the first notification after the restore glues onto it.
+
+        ``_persist_notification`` appends ``json.dumps(note) + "\\n"``, so an
+        unterminated last line plus that append is one line that parses as neither
+        row. The merge branch makes the same repair through ``dst_unterminated``;
+        writing record-wise makes it this branch's job too.
+        """
+        snap, home = self._snap(tmp_path, b'{"ts":"1","msg":"a"}\n{"ts":"2","msg":"b"}')
+        self._merge(snap, home)
+        installed = (home / "notifications.jsonl").read_bytes()
+        assert installed.endswith(b"\n")
+        assert installed == b'{"ts":"1","msg":"a"}\n{"ts":"2","msg":"b"}\n'
+
+    def test_an_oversized_record_installs_nothing(self, tmp_path, monkeypatch):
+        """The cap is a memory bound, and its refusal owes the same all-or-nothing.
+
+        Pinned separately from the encoding case because it is a DIFFERENT
+        exception out of the same reader, and an ``except`` narrowed to the
+        encoding one would leave this reason escaping past the cleanup.
+        """
+        monkeypatch.setattr(snapshot_mod, "_NOTIFICATION_RECORD_CAP", 64)
+        snap, home = self._snap(tmp_path, self.GOOD + b'{"msg":"' + b"x" * 200 + b'"}\n')
+        with pytest.raises(OversizedRecord):
+            self._merge(snap, home)
+        assert not (home / "notifications.jsonl").exists()
+
+    def test_a_concurrent_notification_is_not_deleted_by_the_rollback(self, tmp_path, monkeypatch):
+        """A file this call did not create must survive its refusal.
+
+        Review's finding, and the slip it names is one an exclusive create invites:
+        creating the live file with ``O_EXCL`` proves this call CREATED it, not that
+        it is the only thing that has since written to it. ``apply_import_zip`` runs
+        inside the live gateway, so the dashboard's notification sink can append to
+        a file the copy just created -- and the rollback for a later bad record then
+        deleted that operator's notification along with the prefix.
+
+        Now structural rather than defended: the whole source is validated before the
+        destination is created, so the ordinary refusal has nothing to roll back. The
+        delivery is injected at the validation of the record that aborts, which is
+        the interleaving that broke the earlier revision. Measured on it, the live
+        file and the delivered note are both gone.
+        """
+        snap, home = self._snap(tmp_path, self.GOOD + self.BAD_UTF8)
+        live = home / "notifications.jsonl"
+        delivered = b'{"ts":"2026-03-09T00:00:00Z","msg":"delivered during the restore"}\n'
+        real_key = snapshot_mod._notification_key
+        seen: list[bytes] = []
+
+        def keyed(record, path):
+            seen.append(record)
+            if len(seen) == 2:
+                # What `_persist_notification` does, in its own mode.
+                with open(live, "a", encoding="utf-8") as f:
+                    f.write(delivered.decode())
+            return real_key(record, path)
+
+        monkeypatch.setattr(snapshot_mod, "_notification_key", keyed)
+        with pytest.raises(UndecodableRecord):
+            self._merge(snap, home)
+        assert live.is_file(), "the rollback deleted a file this call did not create"
+        assert live.read_bytes() == delivered, "the delivered notification was altered or lost"
+
+    def test_a_live_file_that_appears_mid_copy_is_not_replaced(self, tmp_path):
+        """A clean source must not clobber a name that filled while it validated.
+
+        The branch was chosen because no live file existed; by publish time one can.
+        Replacing it would delete whatever the dashboard persisted in between, so
+        the publish refuses and leaves the operator's file exactly as it found it.
+        """
+        snap, home = self._snap(tmp_path, self.GOOD)
+        live = home / "notifications.jsonl"
+        appeared = b'{"ts":"2026-03-09T00:00:00Z","msg":"appeared"}\n'
+        live.write_bytes(appeared)
+        with pytest.raises(FileExistsError):
+            snapshot_mod._copy_notifications(snap / "notifications.jsonl", live)
+        assert live.read_bytes() == appeared
+
+    def test_the_data_home_gains_nothing_but_the_notifications_file(self, tmp_path):
+        """No intermediate artifact, which is the second review finding's whole point.
+
+        A temp file in the data home is published through a NAME, and a same-user
+        process that can list the directory can swap what that name holds between
+        the write and the publish. Writing straight to an ``O_EXCL`` destination
+        needs no such name. Asserted as "the directory holds nothing else" rather
+        than "no file called .tmp", so any future intermediate is caught whatever it
+        is named.
+        """
+        snap, home = self._snap(tmp_path, self.GOOD + self.BAD_UTF8)
+        with pytest.raises(UndecodableRecord):
+            self._merge(snap, home)
+        assert sorted(p.name for p in home.iterdir()) == []
+
+        clean, home2 = self._snap(tmp_path / "clean", self.GOOD)
+        self._merge(clean, home2)
+        assert sorted(p.name for p in home2.iterdir()) == ["notifications.jsonl"]
+
+    def test_the_installed_file_is_no_tighter_than_one_the_product_writes(self, tmp_path):
+        """A restored file the dashboard cannot manage is its own outage.
+
+        ``os.open`` takes an explicit mode, so this is a real choice and not a
+        default: 0o666 lets the kernel apply the umask, which is what the plain
+        ``open(path, "a")`` in ``_persist_notification`` gets.
+        """
+        snap, home = self._snap(tmp_path, self.GOOD)
+        self._merge(snap, home)
+        by_product = home / "written-by-the-product.jsonl"
+        with open(by_product, "a", encoding="utf-8") as f:
+            f.write('{"ts":"1"}\n')
+        installed = (home / "notifications.jsonl").stat().st_mode & 0o777
+        assert installed == by_product.stat().st_mode & 0o777, oct(installed)
+
+    def test_a_source_that_changes_between_the_passes_leaves_a_valid_prefix(
+        self, tmp_path, monkeypatch
+    ):
+        """The residual case, and its bound is the property worth pinning.
+
+        Validating the whole source first means the ordinary defect aborts before the
+        destination exists. What remains is a source that CHANGES between the two
+        passes -- the same residue ``_merge_notifications`` documents -- and here the
+        second pass validates before each write, so the prefix is always a SHORT file
+        of valid records rather than a poisoned one. A short history is recoverable
+        from the archive; an unloadable one is what this function exists to prevent.
+        """
+        snap, home = self._snap(tmp_path, self.GOOD + self.MORE)
+        source = snap / "notifications.jsonl"
+        live = home / "notifications.jsonl"
+        real_key = snapshot_mod._notification_key
+        seen: list[bytes] = []
+
+        def keyed(record, path):
+            seen.append(record)
+            # Pass 1 validates both records and passes; the source is poisoned as it
+            # finishes, so pass 2 opens a file that no longer matches what was
+            # validated. Rewriting DURING pass 2 proves nothing -- the reader has
+            # already buffered the records it will yield.
+            if len(seen) == 2:
+                source.write_bytes(self.GOOD + self.BAD_UTF8)
+            return real_key(record, path)
+
+        monkeypatch.setattr(snapshot_mod, "_notification_key", keyed)
+        with pytest.raises(UndecodableRecord):
+            self._merge(snap, home)
+
+        assert live.is_file(), "the prefix was rolled back, which is what took a live file"
+        body = live.read_bytes()
+        assert body == self.GOOD, "the prefix is not exactly the records that validated"
+        body.decode("utf-8")  # the property that matters: still loadable
+
+    @requires_symlinks
+    def test_a_dangling_symlink_at_the_live_name_is_refused(self, tmp_path):
+        """``is_file()`` calls a dangling link absent, and ``copy2`` wrote THROUGH it.
+
+        So the branch was chosen because "no live file exists" while a link sat at
+        the name, and the archive's bytes landed on the link's target -- outside
+        the data home. The publish refuses instead, and the refusal must not delete
+        the file the link points at either.
+        """
+        snap, home = self._snap(tmp_path, self.GOOD)
+        outside = tmp_path / "outside.jsonl"
+        (home / "notifications.jsonl").symlink_to(outside)
+        with pytest.raises(FileExistsError):
+            self._merge(snap, home)
+        assert not outside.exists(), "the archive's bytes were written outside the data home"
+        assert (home / "notifications.jsonl").is_symlink(), "the operator's link was removed"
+
+
 # ── Issue #8217: the restore status line must not claim success over a refused
 # cron merge ───────────────────────────────────────────────────────────────────
 
