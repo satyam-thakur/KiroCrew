@@ -13665,7 +13665,23 @@
       "wake_error": "Aufweckquellen dieses Mitglieds konnten nicht geladen werden.",
       "wake_paused": "pausiert",
       "wake_webhook": "Webhook",
-      "activity_error": "Aktivität dieses Mitglieds konnte nicht geladen werden."
+      "activity_error": "Aktivität dieses Mitglieds konnte nicht geladen werden.",
+      "webview_heading": "Dashboard",
+      "webview_collapse": "Dashboard einklappen",
+      "webview_open": "Dashboard öffnen",
+      "webview_value_yes": "ja",
+      "webview_value_no": "nein",
+      "webview_age_s": "{{n}} s",
+      "webview_age_m": "{{n}} min",
+      "webview_age_h": "{{n}} Std.",
+      "webview_age_d": "{{n}} T",
+      "webview_contained": "Isoliert",
+      "webview_contained_detail": "von dieser Crew gefüllt, in einer Sandbox ohne Netzwerk und ohne Zugriff auf diese Seite gerendert",
+      "webview_empty": "Diese Crew hat ihr Dashboard noch nicht gefüllt.",
+      "webview_error": "Das Dashboard dieser Crew konnte nicht gerendert werden.",
+      "webview_frame_title": "Von {{crew}} gefülltes Dashboard",
+      "webview_rendering": "Dashboard wird gerendert…",
+      "webview_retry": "Erneut versuchen"
     }
   },
   "privacyDisclosure": {

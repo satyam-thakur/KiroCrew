@@ -6479,6 +6479,14 @@ _SENSITIVE_HOME_DIRS: list[str] = [
 _CREW_HOME_PREFIXES: tuple[str, ...] = (".kiro/crew", ".kirocrew")
 _CREW_SECRET_LEAVES: list[str] = [
     ".env",
+    # Operator-authored panel templates (agent_panel.py). Fenced for a stronger
+    # reason than privacy: a crew's webview is a human-authored TEMPLATE filled
+    # with crew-published DATA, and that split is the whole containment story --
+    # layout is reviewed, only data is untrusted, so data can be escaped at one
+    # boundary. An agent's auto-approved file tools could otherwise drop a .html
+    # in here and author markup directly, collapsing the split and handing a
+    # hostile issue body a path into a rendered document.
+    "panel-templates",
     # Owner-authored meetings edits are deliberately outside the meeting
     # directories agents write. They are returned verbatim to the owner and may
     # contain credential-shaped examples or private corrections, so an agent must

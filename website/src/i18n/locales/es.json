@@ -13844,7 +13844,23 @@
       "wake_error": "No se pudieron cargar las fuentes de activación de este miembro.",
       "wake_paused": "en pausa",
       "wake_webhook": "webhook",
-      "activity_error": "No se pudo cargar la actividad de este miembro."
+      "activity_error": "No se pudo cargar la actividad de este miembro.",
+      "webview_heading": "Panel",
+      "webview_collapse": "Contraer el panel",
+      "webview_open": "Abrir el panel",
+      "webview_value_yes": "sí",
+      "webview_value_no": "no",
+      "webview_age_s": "{{n}} s",
+      "webview_age_m": "{{n}} min",
+      "webview_age_h": "{{n}} h",
+      "webview_age_d": "{{n}} d",
+      "webview_contained": "Aislado",
+      "webview_contained_detail": "rellenado por este equipo, renderizado en un entorno aislado sin red y sin acceso a esta página",
+      "webview_empty": "Este equipo aún no ha rellenado su panel.",
+      "webview_error": "No se pudo renderizar el panel de este equipo.",
+      "webview_frame_title": "Panel rellenado por {{crew}}",
+      "webview_rendering": "Renderizando el panel…",
+      "webview_retry": "Reintentar"
     }
   },
   "privacyDisclosure": {

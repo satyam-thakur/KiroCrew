@@ -419,6 +419,15 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         # cookie auth and are refused before the handler's own session
         # recognition can run.
         "/api/session-ledger",
+        # MCP-only (panel_publish / panel_templates tools); no browser caller --
+        # the drawer READS through "/api/members/{slug}/panel", which is
+        # registered by the same module a few lines below and deliberately NOT
+        # under this prefix so it keeps cookie auth. Prefix matching covers both
+        # "/api/agent-panel/publish" and "/api/agent-panel/templates". Same
+        # wiring class as the ledger above: without this entry the
+        # internal-secret call falls through to cookie auth and every publish
+        # fails with 403.
+        "/api/agent-panel",
         # MCP-only (knowledge_add_document tool); no browser caller — the
         # dashboard ingests via its own cookie-authed knowledge routes. Same
         # wiring class as "/api/notifications/agent" above.
@@ -1355,6 +1364,27 @@ def _deferred_session_control(handler_name: str) -> Callable:
     return _route
 
 
+def _deferred_agent_panel(handler_name: str) -> Callable:
+    """Bind a crew-webview route without importing the subsystem at boot.
+
+    Same shape, and the same reason, as ``_deferred_session_control`` above: the
+    panel store is an OPTIONAL subsystem -- its MCP server ships gated off
+    (``opt_in``) and most installs never publish a panel -- so importing it inside
+    ``_register_mcp_routes`` loaded it on every gateway launch, before the socket
+    binds, for a feature the operator may never grant. Route registration at boot
+    is fine; only the import moves to first request.
+    """
+
+    async def _route(request: web.Request) -> web.StreamResponse:
+        from kiro_crew.dashboard.handlers import agent_panel
+
+        handler = getattr(agent_panel, handler_name)
+        return await handler(request)
+
+    _route.__name__ = handler_name
+    return _route
+
+
 def _register_mcp_routes(app: web.Application) -> None:
     """Register API routes used by MCP tools (spawn, lessons, crons, etc.)."""
     app.router.add_post("/api/spawn", handlers.api_spawn)
@@ -1375,6 +1405,22 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_delete("/api/lessons", handlers.api_lessons_delete)
     app.router.add_get("/api/session-ledger", handlers.api_session_ledger_get)
     app.router.add_post("/api/session-ledger/record", handlers.api_session_ledger_record)
+    # The write half of the agent panel surface -- MCP-only, like the ledger
+    # above. The READ, "/api/members/{slug}/panel", is registered here too and
+    # stays on cookie auth because a browser is its only caller.
+    #
+    # Registered route-by-route through the deferred binder rather than by
+    # calling the module's own `register_agent_panel_routes`: that call would
+    # import the module at boot, which is what the boot-path rule forbids for an
+    # optional subsystem. The paths are duplicated from that function, and
+    # `test_agent_panel_routes` pins both spellings against each other.
+    app.router.add_get(
+        "/api/agent-panel/templates", _deferred_agent_panel("api_agent_panel_templates")
+    )
+    app.router.add_post(
+        "/api/agent-panel/publish", _deferred_agent_panel("api_agent_panel_publish")
+    )
+    app.router.add_get("/api/members/{slug}/panel", _deferred_agent_panel("api_member_panel"))
     app.router.add_get("/api/crons", handlers.api_crons)
     app.router.add_post("/api/crons", handlers.api_crons_create)
     app.router.add_delete("/api/crons", handlers.api_cron_batch_delete)

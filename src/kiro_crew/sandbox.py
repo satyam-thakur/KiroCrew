@@ -235,6 +235,20 @@ _CREW_READONLY_LEAVES: tuple[str, ...] = (
     # gateway ensures the file exists at startup (see apply_dev_mode's
     # reconcile) because the Linux launcher can only seal an EXISTING target.
     "apps/.dev-grants.json",
+    # The crew webview template directory. A ceiling in exactly the sense above:
+    # the whole value of splitting a panel into human-authored TEMPLATE and
+    # agent-published DATA is that layout is authored by a person, so a crew must
+    # never be able to write one -- a template it authored could put markup, and
+    # therefore a hostile issue body's markup, straight into the operator's
+    # dashboard. ``security._CREW_SECRET_LEAVES`` fences it from the agent FILE
+    # TOOLS; sealing it read-only here closes the other half, because a fence that
+    # only covers file tools is bypassed by any spawned shell that can write.
+    #
+    # READ-ONLY rather than masked, and the direction matters: templates are
+    # versioned, human-reviewed repo content with nothing secret in them, so
+    # reading one costs nothing, while hiding a directory the OPERATOR drops
+    # overrides into would silently change which template renders.
+    "panel-templates",
 )
 
 #: Crew-home leaves that MUST stay read-write for a sandboxed process. Every entry is
@@ -320,7 +334,17 @@ _CREW_READONLY_TARGETS: list[str] = _crew_home_entries(_CREW_READONLY_LEAVES)
 #: this list closes: a mask needs the opposite treatment (an empty bind OVER the
 #: name), and ``_CREW_HIDDEN_LEAVES`` has no reader to prove an empty document is
 #: absent-equivalent, so each leaf needs its own argument.
-_CREW_PRECREATE_READONLY_DIR_LEAVES: tuple[str, ...] = ("profiles",)
+_CREW_PRECREATE_READONLY_DIR_LEAVES: tuple[str, ...] = (
+    "profiles",
+    # The crew webview template directory. A fence only fences an EXISTING path:
+    # the Linux launcher skips the read-only mount for an absent target, so on a
+    # fresh install -- where no operator has dropped an override yet -- the
+    # directory does not exist, the seal is silently skipped, and the agent can
+    # create it and author its own template. Which is precisely the write the
+    # read-only listing above exists to deny, so without this entry that listing
+    # protects only hosts that happen to have the directory already.
+    "panel-templates",
+)
 _CREW_PRECREATE_READONLY_FILE_LEAVES: tuple[str, ...] = (
     "computer_use.json",
     "oauth_endpoints.json",

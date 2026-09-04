@@ -13487,7 +13487,23 @@
       "wake_error": "このメンバーの起動ソースを読み込めませんでした。",
       "wake_paused": "一時停止中",
       "wake_webhook": "Webhook",
-      "activity_error": "このメンバーのアクティビティを読み込めませんでした。"
+      "activity_error": "このメンバーのアクティビティを読み込めませんでした。",
+      "webview_heading": "ダッシュボード",
+      "webview_collapse": "ダッシュボードを折りたたむ",
+      "webview_open": "ダッシュボードを開く",
+      "webview_value_yes": "はい",
+      "webview_value_no": "いいえ",
+      "webview_age_s": "{{n}}秒",
+      "webview_age_m": "{{n}}分",
+      "webview_age_h": "{{n}}時間",
+      "webview_age_d": "{{n}}日",
+      "webview_contained": "隔離済み",
+      "webview_contained_detail": "このクルーが記入し、ネットワークにもこのページにもアクセスできないサンドボックス内で描画されています",
+      "webview_empty": "このクルーはまだダッシュボードを記入していません。",
+      "webview_error": "このクルーのダッシュボードを描画できませんでした。",
+      "webview_frame_title": "{{crew}} が記入したダッシュボード",
+      "webview_rendering": "ダッシュボードを描画しています…",
+      "webview_retry": "再試行"
     }
   },
   "privacyDisclosure": {

@@ -88,7 +88,19 @@ export const CHUNK_BUDGETS = {
   // The app-core chunk: the dashboard shell plus everything eagerly imported
   // from it. The vendor split in vite.config.ts already extracts the heaviest
   // libraries; what remains is first-party code with no clean lazy boundary.
-  App: 3200 * KB, // measured 3121 KB
+  //
+  // RE-MEASURED (was 3200 KB, comment claimed 3121 KB). The recorded measurement
+  // had gone stale by ~80 KB and the chunk crossed the ceiling by 1.3 KB on
+  // `main` itself -- an `origin/main` analyze build emits 3278163 bytes, byte for
+  // byte what the crew-webview branch emits, module count 734 both sides. So this
+  // is ceiling drift, not a regression: the branch that re-measured it adds ZERO
+  // bytes here (its component lands in the MembersPage chunk and its 13 locale
+  // catalogs land in the i18n chunks). Same fix as PR #8412 did for the t-chunk.
+  //
+  // No import boundary was available to try instead: manualChunks in
+  // vite.config.ts returns early for anything outside node_modules, so
+  // first-party code cannot be routed out of this chunk that way.
+  App: 3280 * KB, // measured 3201 KB
 
   // Markdown/math/syntax rendering stack (katex, highlight.js, remark/rehype)
   // -- one deliberate `manualChunks` bucket, see vite.config.ts.

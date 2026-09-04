@@ -13487,7 +13487,23 @@
       "wake_error": "无法加载此成员的唤醒来源。",
       "wake_paused": "已暂停",
       "wake_webhook": "webhook",
-      "activity_error": "无法加载此成员的活动记录。"
+      "activity_error": "无法加载此成员的活动记录。",
+      "webview_heading": "仪表板",
+      "webview_collapse": "收起仪表板",
+      "webview_open": "打开仪表板",
+      "webview_value_yes": "是",
+      "webview_value_no": "否",
+      "webview_age_s": "{{n}}秒",
+      "webview_age_m": "{{n}}分钟",
+      "webview_age_h": "{{n}}小时",
+      "webview_age_d": "{{n}}天",
+      "webview_contained": "已隔离",
+      "webview_contained_detail": "由该小队填写，在无网络且无法访问本页面的沙箱中渲染",
+      "webview_empty": "该小队尚未填写其仪表板。",
+      "webview_error": "无法渲染该小队的仪表板。",
+      "webview_frame_title": "由 {{crew}} 填写的仪表板",
+      "webview_rendering": "正在渲染仪表板…",
+      "webview_retry": "重试"
     }
   },
   "privacyDisclosure": {

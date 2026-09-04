@@ -13487,7 +13487,23 @@
       "wake_error": "이 멤버의 웨이크 소스를 불러오지 못했습니다.",
       "wake_paused": "일시 중지됨",
       "wake_webhook": "웹훅",
-      "activity_error": "이 멤버의 활동을 불러오지 못했습니다."
+      "activity_error": "이 멤버의 활동을 불러오지 못했습니다.",
+      "webview_heading": "대시보드",
+      "webview_collapse": "대시보드 접기",
+      "webview_open": "대시보드 열기",
+      "webview_value_yes": "예",
+      "webview_value_no": "아니요",
+      "webview_age_s": "{{n}}초",
+      "webview_age_m": "{{n}}분",
+      "webview_age_h": "{{n}}시간",
+      "webview_age_d": "{{n}}일",
+      "webview_contained": "격리됨",
+      "webview_contained_detail": "이 크루가 채웠으며, 네트워크와 이 페이지에 접근할 수 없는 샌드박스에서 렌더링됩니다",
+      "webview_empty": "이 크루는 아직 대시보드를 채우지 않았습니다.",
+      "webview_error": "이 크루의 대시보드를 렌더링할 수 없습니다.",
+      "webview_frame_title": "{{crew}}이(가) 채운 대시보드",
+      "webview_rendering": "대시보드를 렌더링하는 중…",
+      "webview_retry": "다시 시도"
     }
   },
   "privacyDisclosure": {

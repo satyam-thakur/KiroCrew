@@ -33,6 +33,7 @@ import { markSlotRead } from '../../store/dashboardSlice'
 import CrewAvatar from '../../components/CrewAvatar'
 import ChatPane from '../../components/ChatPane'
 import DetailPanel from '../../components/DetailPanel'
+import CrewWebview from './CrewWebview'
 import ErrorBoundary from '../../components/ErrorBoundary'
 import { useIsMobile } from '../../hooks/useIsMobile'
 import { SearchInput } from '../../components/ui'
@@ -618,6 +619,14 @@ export default function MembersPage() {
               <div className="text-[11px] text-muted">{t('pages.membersPage.stat_week')}</div>
             </div>
           </div>
+          {/* The crew's own webview. First, and above the activity counts: this
+              is the surface the crew fills in to answer "what am I holding, what
+              is stuck, what needs you", which is what the operator opened the
+              drawer for. The counts below are context, not the answer. */}
+          <div className="text-[11px] font-semibold tracking-wide text-muted mb-1.5">
+            {t('pages.membersPage.webview_heading')}
+          </div>
+          {activeSlug ? <CrewWebview slug={activeSlug} /> : null}
           <div className="text-[11px] font-semibold tracking-wide text-muted mb-1.5">
             {t('pages.membersPage.recent_activity')}
           </div>

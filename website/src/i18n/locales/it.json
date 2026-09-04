@@ -13843,7 +13843,23 @@
       "wake_error": "Impossibile caricare le origini di attivazione di questo membro.",
       "wake_paused": "in pausa",
       "wake_webhook": "webhook",
-      "activity_error": "Impossibile caricare l'attività di questo membro."
+      "activity_error": "Impossibile caricare l'attività di questo membro.",
+      "webview_heading": "Dashboard",
+      "webview_collapse": "Comprimi la dashboard",
+      "webview_open": "Apri la dashboard",
+      "webview_value_yes": "sì",
+      "webview_value_no": "no",
+      "webview_age_s": "{{n}} s",
+      "webview_age_m": "{{n}} min",
+      "webview_age_h": "{{n}} h",
+      "webview_age_d": "{{n}} g",
+      "webview_contained": "Isolato",
+      "webview_contained_detail": "compilata da questa crew, resa in una sandbox senza rete e senza accesso a questa pagina",
+      "webview_empty": "Questa crew non ha ancora compilato la sua dashboard.",
+      "webview_error": "Non è stato possibile rendere la dashboard di questa crew.",
+      "webview_frame_title": "Dashboard compilata da {{crew}}",
+      "webview_rendering": "Rendering della dashboard…",
+      "webview_retry": "Riprova"
     }
   },
   "privacyDisclosure": {
